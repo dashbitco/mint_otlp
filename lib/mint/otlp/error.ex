@@ -5,11 +5,10 @@ defmodule Mint.OTLP.Error do
 
   The public fields are:
 
-    * `:transport` - the transport that returned the error, such as
-      `Mint.OTLP.GRPC`
+    * `:transport` - the module of the transport that returned the error
 
-    * `:code` - the error code, specific to the transport. For example,
-      `Mint.OTLP.GRPC` uses gRPC status codes, see `t:Mint.OTLP.GRPC.code/0`
+    * `:code` - the error code, specific to the transport. With the
+      `:grpc` transport, it is a gRPC status code, see `t:grpc_code/0`
 
     * `:message` - a message describing the error, which may be empty
 
@@ -19,6 +18,27 @@ defmodule Mint.OTLP.Error do
   Errors from the underlying connection are returned as `Mint.HTTPError`
   and `Mint.TransportError`.
   """
+
+  @typedoc """
+  A gRPC status code other than `OK`.
+  """
+  @type grpc_code() ::
+          :cancelled
+          | :unknown
+          | :invalid_argument
+          | :deadline_exceeded
+          | :not_found
+          | :already_exists
+          | :permission_denied
+          | :resource_exhausted
+          | :failed_precondition
+          | :aborted
+          | :out_of_range
+          | :unimplemented
+          | :internal
+          | :unavailable
+          | :data_loss
+          | :unauthenticated
 
   @type t() :: %__MODULE__{
           transport: module(),

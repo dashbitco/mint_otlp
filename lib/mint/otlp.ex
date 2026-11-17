@@ -7,17 +7,17 @@ defmodule Mint.OTLP do
   not spawn processes: a client is a data structure owned by a process,
   which gives the messages it receives to `stream/2`.
 
+  It takes care of connecting, retrying, and reconnecting, as defined
+  by the OTLP specification and configured when creating the client.
+
   `Mint.OTLP` does not encode telemetry. `export/4` takes a request,
   such as an `ExportTraceServiceRequest`, already encoded as protobuf.
-  On the other hand, it takes care of connecting, retrying, and
-  reconnecting, as defined by the OTLP specification and configured
-  when creating the client.
 
   ## Transports
 
   The transport is chosen with the `:transport` option to `new/4`:
 
-    * `:grpc` - OTLP/gRPC, see `Mint.OTLP.GRPC`
+    * `:grpc` - OTLP/gRPC
 
   ## Usage
 
@@ -42,6 +42,24 @@ defmodule Mint.OTLP do
       either because the error is not retryable or because retries were
       exhausted. Exports that could not be sent at all fail with the
       last error of the client, such as a connection error.
+
+  ## Retries
+
+  As defined by the OTLP specification, failed exports are retried
+  when the server returns `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`,
+  `OUT_OF_RANGE`, `UNAVAILABLE`, or `DATA_LOSS`, or `RESOURCE_EXHAUSTED`
+  with a retry delay, and when an attempt times out. These failures are
+  about the server, so the whole client backs off: no export starts and
+  no connection is attempted until the backoff ends. Backoff is
+  exponential with jitter, respects the delay given by the server, if
+  any, and resets once an export succeeds.
+
+  Exports that do not succeed within `:max_elapsed_time` fail. If they
+  are waiting to be sent, they fail with the last error the client got
+  since an export last succeeded, or with `DEADLINE_EXCEEDED` if none.
+
+  Failures that lead to retries are logged at the info level, and
+  dropped exports at the error level.
   """
 
   alias Mint.OTLP.GRPC
@@ -49,7 +67,7 @@ defmodule Mint.OTLP do
   @typedoc """
   A client, as returned by `new/4`.
   """
-  @type t() :: GRPC.t()
+  @opaque t() :: GRPC.t()
 
   @typedoc """
   The kind of telemetry.
@@ -76,6 +94,8 @@ defmodule Mint.OTLP do
 
   @callback close(t()) :: {:responses, t(), [response()]}
 
+  @user_agent "mint-otlp/#{Mix.Project.config()[:version]}"
+
   @doc """
   Creates a client for an OTLP endpoint.
 
@@ -85,14 +105,47 @@ defmodule Mint.OTLP do
 
     * `:transport` - the OTLP transport. Only `:grpc` is supported.
 
-  Other options are given to the transport. See `Mint.OTLP.GRPC`.
+    * `:headers` - headers to send with every export, such as
+      `authorization`
+
+    * `:user_agent` - the `user-agent` header. The OTLP specification
+      recommends identifying the exporter and its version. Defaults to
+      `"#{@user_agent}"`
+
+  ## GRPC options
+
+    * `:timeout` - how long to wait for the response to each attempt,
+      in milliseconds, also sent to the server as `grpc-timeout`. It
+      also sets how quickly dead connections are detected and is used
+      as the `:send_timeout` of the socket, unless one is given in
+      `:transport_opts`. Defaults to `10_000`
+
+    * `:retry` - `false` to disable retries, `true` for the defaults,
+      or a keyword list with:
+
+      * `:initial_backoff` - the delay before the first retry, in
+        milliseconds. Defaults to `5_000`
+
+      * `:max_backoff` - the maximum delay between retries, in
+        milliseconds. Defaults to `30_000`
+
+      * `:max_elapsed_time` - for how long an export may wait to be sent
+        or retried, in milliseconds. Defaults to `300_000`
+
+      Without retries, exports fail on their first failure, or if they
+      cannot be sent within `:timeout`. The backoff options still apply
+      to reconnects.
+
+  Other options are given to `Mint.HTTP2.connect/4`, except for `:mode`,
+  which is always `:active`. Connecting blocks the calling process, so
+  consider giving a `:timeout` in `:transport_opts`.
   """
   @spec new(Mint.Types.scheme(), Mint.Types.address(), :inet.port_number(), keyword()) :: t()
   def new(scheme, address, port, opts \\ []) do
     {transport, opts} = Keyword.pop(opts, :transport, :grpc)
 
     case transport do
-      :grpc -> GRPC.new(scheme, address, port, opts)
+      :grpc -> GRPC.new(scheme, address, port, Keyword.put_new(opts, :user_agent, @user_agent))
       other -> raise ArgumentError, "unknown OTLP transport: #{inspect(other)}"
     end
   end

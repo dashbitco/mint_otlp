@@ -1,93 +1,7 @@
 defmodule Mint.OTLP.GRPC do
-  @user_agent "mint-otlp/#{Mix.Project.config()[:version]}"
-
-  @moduledoc """
-  OTLP/gRPC transport.
-
-  Each export is a unary gRPC call to the `Export` method of the
-  signal's service, over a single `Mint.HTTP2` connection. Use the
-  functions in `Mint.OTLP` to work with it.
-
-  ## Options
-
-    * `:headers` - headers to send with every export, such as
-      `authorization`
-
-    * `:user_agent` - the `user-agent` header. The OTLP specification
-      recommends identifying the exporter and its version. Defaults to
-      `"#{@user_agent}"`
-
-    * `:timeout` - how long to wait for the response to each attempt,
-      in milliseconds, also sent to the server as `grpc-timeout`. It
-      also sets how quickly dead connections are detected and is used
-      as the `:send_timeout` of the socket, unless one is given in
-      `:transport_opts`. Defaults to `10_000`
-
-    * `:retry` - `false` to disable retries, `true` for the defaults,
-      or a keyword list with:
-
-      * `:initial_backoff` - the delay before the first retry, in
-        milliseconds. Defaults to `5_000`
-
-      * `:max_backoff` - the maximum delay between retries, in
-        milliseconds. Defaults to `30_000`
-
-      * `:max_elapsed_time` - for how long an export may wait to be sent
-        or retried, in milliseconds. Defaults to `300_000`
-
-      Without retries, exports fail on their first failure, or if they
-      cannot be sent within `:timeout`. The backoff options still apply
-      to reconnects.
-
-  Other options are given to `Mint.HTTP2.connect/4`, except for `:mode`,
-  which is always `:active`. Connecting blocks the calling process, so
-  consider giving a `:timeout` in `:transport_opts`.
-
-  ## Retries
-
-  As defined by the OTLP specification, failed exports are retried
-  when the server returns `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`,
-  `OUT_OF_RANGE`, `UNAVAILABLE`, or `DATA_LOSS`, or `RESOURCE_EXHAUSTED`
-  with a retry delay, and when an attempt times out. These failures are
-  about the server, so the whole client backs off: no export starts and
-  no connection is attempted until the backoff ends. Backoff is
-  exponential with jitter, respects the delay given by the server, if
-  any, and resets once an export succeeds.
-
-  Requests left unprocessed by a GOAWAY, and requests in flight when
-  the connection closes, are sent again on a new connection, without
-  backing off. As the server may have processed some of them, an export
-  may be received more than once. The first reconnect after an export
-  succeeded is immediate, and the following ones back off. Requests the
-  server refuses, with REFUSED_STREAM, are retried after backing off,
-  as the connection remains. When the server sends a GOAWAY, no new
-  exports start on the connection, and the ones the server is
-  processing may still finish. Once they do, the others start on a new
-  connection.
-
-  Exports that do not succeed within `:max_elapsed_time` fail. If they
-  are waiting to be sent, they fail with the last error the client got
-  since an export last succeeded, or with `DEADLINE_EXCEEDED` if none.
-
-  Backoffs and connections closed with exports in flight are logged at
-  the info level, and exports the client gives up on at the error level.
-
-  ## Dead connections
-
-  A connection may stop working without being closed. When an export
-  gets no response within `:timeout`, if the server sent nothing on the
-  connection during that time, the connection is considered dead and
-  closed, and its exports are sent again on a new one. Otherwise, only
-  that export is cancelled and retried.
-
-  ## Flow control
-
-  `Mint.HTTP2` keeps track of the HTTP/2 flow control windows but never
-  waits on them. A request that fits the windows is sent at once.
-  Otherwise, this module sends as much of the body as the windows allow,
-  which `Mint.HTTP2` splits into frames, and the rest as WINDOW_UPDATE
-  frames arrive.
-  """
+  # OTLP/gRPC transport. Each export is a unary gRPC call to the `Export`
+  # method of the signal's service, over a single `Mint.HTTP2` connection.
+  @moduledoc false
 
   @behaviour Mint.OTLP
 
@@ -130,33 +44,10 @@ defmodule Mint.OTLP.GRPC do
     :data_loss
   ]
 
-  @retry_info "type.googleapis.com/google.rpc.RetryInfo"
-
   @retry_defaults [initial_backoff: 5_000, max_backoff: 30_000, max_elapsed_time: 300_000]
 
   # Large writes block the owner and may exceed the socket send timeout
   @max_write 128 * 1024
-
-  @typedoc """
-  A gRPC status code other than `OK`, the `:code` of `Mint.OTLP.Error`.
-  """
-  @type code() ::
-          :cancelled
-          | :unknown
-          | :invalid_argument
-          | :deadline_exceeded
-          | :not_found
-          | :already_exists
-          | :permission_denied
-          | :resource_exhausted
-          | :failed_precondition
-          | :aborted
-          | :out_of_range
-          | :unimplemented
-          | :internal
-          | :unavailable
-          | :data_loss
-          | :unauthenticated
 
   @opaque t() :: %__MODULE__{}
 
@@ -199,8 +90,8 @@ defmodule Mint.OTLP.GRPC do
 
   @impl Mint.OTLP
   def new(scheme, address, port, opts) do
+    {user_agent, opts} = Keyword.pop!(opts, :user_agent)
     {headers, opts} = Keyword.pop(opts, :headers, [])
-    {user_agent, opts} = Keyword.pop(opts, :user_agent, @user_agent)
     {timeout, opts} = Keyword.pop(opts, :timeout, 10_000)
     {retry, opts} = Keyword.pop(opts, :retry, true)
 
@@ -417,10 +308,10 @@ defmodule Mint.OTLP.GRPC do
       end)
 
     # Servers routinely close connections, so the first time we
-    # reconnect right away, when the timer fires, unless backing off
+    # reconnect right away, when the timer fires. A success does not end
+    # a backoff, so we may still be backing off.
     if client.failures == 0 do
-      now = now()
-      backoff_until = max(client.backoff_until || now, now)
+      backoff_until = client.backoff_until || now()
       {%{client | failures: 1, backoff_until: backoff_until, last_error: error}, acc}
     else
       {back_off(client, error), acc}
@@ -648,6 +539,12 @@ defmodule Mint.OTLP.GRPC do
 
   ## Sending
 
+  # Mint.HTTP2 keeps track of the HTTP/2 flow control windows but never
+  # waits on them. A request that fits the windows is sent at once.
+  # Otherwise, we send as much of the body as the windows allow, which
+  # Mint.HTTP2 splits into frames, and the rest as WINDOW_UPDATE frames
+  # arrive, from send_bodies/2.
+
   # Starts queued exports while not backing off and the connection is
   # writable and has room for more streams.
   defp start_queued(client, acc) do
@@ -827,7 +724,7 @@ defmodule Mint.OTLP.GRPC do
   defp result(request) do
     case List.keyfind(request.response_headers, "grpc-status", 0) do
       {_, "0"} when request.status == 200 ->
-        case decode_response(IO.iodata_to_binary(request.data)) do
+        case decode_response(request.data) do
           {:ok, partial_success} -> {:ok, partial_success}
           :error -> {:error, error(:internal, "malformed response message")}
         end
@@ -880,54 +777,20 @@ defmodule Mint.OTLP.GRPC do
     end
   end
 
-  # The response is an Export*ServiceResponse whose partial_success
-  # (field 1) has the number of rejected items (field 1) and an error
-  # message (field 2), regardless of the signal.
-  defp decode_response(<<>>), do: {:ok, %{rejected: 0, error_message: ""}}
-
-  defp decode_response(<<0, size::32, message::binary-size(size)>>) do
-    with {:ok, fields} <- Protobuf.decode(message) do
-      case List.keyfind(fields, 1, 0) do
-        {1, partial_success} ->
-          with {:ok, fields} <- Protobuf.decode(partial_success) do
-            {1, rejected} = List.keyfind(fields, 1, 0, {1, 0})
-            {2, error_message} = List.keyfind(fields, 2, 0, {2, ""})
-            {:ok, %{rejected: rejected, error_message: error_message}}
-          end
-
-        _ ->
-          {:ok, %{rejected: 0, error_message: ""}}
-      end
+  # The response is a single message, which may be omitted when empty.
+  defp decode_response(data) do
+    case IO.iodata_to_binary(data) do
+      <<>> -> Protobuf.decode_export_response(<<>>)
+      <<0, size::32, message::binary-size(size)>> -> Protobuf.decode_export_response(message)
+      _ -> :error
     end
   end
 
-  defp decode_response(_data), do: :error
-
-  # The retry delay comes as a google.rpc.RetryInfo in the details
-  # (field 3) of the google.rpc.Status in grpc-status-details-bin.
+  # The retry delay comes in the google.rpc.Status of grpc-status-details-bin.
   defp retry_after_header(headers) do
     with {_, details} <- List.keyfind(headers, "grpc-status-details-bin", 0),
-         {:ok, status} <- Base.decode64(details, padding: false),
-         {:ok, fields} <- Protobuf.decode(status) do
-      Enum.find_value(fields, fn
-        {3, any} -> retry_info(any)
-        _ -> nil
-      end)
-    else
-      _ -> nil
-    end
-  end
-
-  defp retry_info(any) do
-    with {:ok, fields} <- Protobuf.decode(any),
-         {1, @retry_info} <- List.keyfind(fields, 1, 0),
-         {2, retry_info} <- List.keyfind(fields, 2, 0),
-         {:ok, fields} <- Protobuf.decode(retry_info),
-         {1, duration} <- List.keyfind(fields, 1, 0),
-         {:ok, fields} <- Protobuf.decode(duration) do
-      {1, seconds} = List.keyfind(fields, 1, 0, {1, 0})
-      {2, nanos} = List.keyfind(fields, 2, 0, {2, 0})
-      seconds * 1000 + div(nanos, 1_000_000)
+         {:ok, status} <- Base.decode64(details, padding: false) do
+      Protobuf.decode_retry_after(status)
     else
       _ -> nil
     end
