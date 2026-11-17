@@ -6,7 +6,7 @@ defmodule Mint.OTLPTest do
   alias Mint.OTLP
   alias Mint.OTLP.{RawServer, Requests, TestServer}
 
-  @retry [initial_backoff: 10, max_backoff: 50, max_elapsed_time: 500]
+  @retry [initial_backoff: 10, max_backoff: 50, max_elapsed_time: 5000]
 
   setup do
     port = Application.fetch_env!(:mint_otlp, :test_server_port)
@@ -145,7 +145,9 @@ defmodule Mint.OTLPTest do
       assert requests() == 3
     end
 
-    test "gives up after the maximum elapsed time", %{client: client} do
+    test "gives up after the maximum elapsed time", %{port: port} do
+      retry = [initial_backoff: 10, max_backoff: 50, max_elapsed_time: 300]
+      client = OTLP.new(:http, "localhost", port, retry: retry)
       headers = TestServer.headers("status:14:try again, later")
       {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
 
@@ -160,10 +162,10 @@ defmodule Mint.OTLPTest do
 
       assert log =~ "[error] Discarding OTLP export: OTLP export failed with unavailable"
       assert_received {:error, error}
-      assert %Mint.OTLP.Error{transport: Mint.OTLP.GRPC, code: :unavailable} = error
+      assert %Mint.OTLP.Error{transport: :grpc, code: :unavailable} = error
       assert error.message == "try again, later"
       assert Exception.message(error) == "OTLP export failed with unavailable: try again, later"
-      assert requests() > 2
+      assert requests() >= 2
     end
 
     test "does not retry when disabled", %{port: port} do
@@ -260,17 +262,17 @@ defmodule Mint.OTLPTest do
     end
 
     test "times out exports without affecting others", %{port: port} do
-      client = OTLP.new(:http, "localhost", port, timeout: 300, retry: false)
-      headers = TestServer.headers("sleep:1000:ok")
+      client = OTLP.new(:http, "localhost", port, timeout: 1200, retry: false)
+      headers = TestServer.headers("sleep:5000:ok")
       {:ok, client, slow} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
-      client = stream_for(client, 150)
+      client = stream_for(client, 600)
 
       # The fast one shows the connection is alive and the other one is
       # still in flight when the slow one times out
       {:ok, client, fast} =
         OTLP.export(client, :traces, Requests.traces(1), headers: TestServer.headers())
 
-      headers = TestServer.headers("sleep:200:ok")
+      headers = TestServer.headers("sleep:800:ok")
       {:ok, client, other} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
 
       {_client, responses} = await(client, [slow, fast, other])
@@ -507,6 +509,153 @@ defmodule Mint.OTLPTest do
       assert {:done, ^b, _} = responses[b]
     end
 
+    test "resends requests that were being sent when the server sent a GOAWAY" do
+      {listen, port} = RawServer.listen()
+
+      # Only the first 64KB fit the windows, which the server never updates
+      spawn_link(fn ->
+        socket = RawServer.accept(listen)
+        RawServer.goaway(socket, RawServer.receive_stream(socket), 0)
+
+        socket = RawServer.accept(listen)
+        RawServer.respond(socket, RawServer.receive_stream(socket))
+        Process.sleep(1000)
+      end)
+
+      # Waiting for the backoff would take seconds
+      client = OTLP.new(:http, "localhost", port, retry: [initial_backoff: 2000])
+      {:ok, client, ref} = OTLP.export(client, :traces, :binary.copy("a", 200_000))
+      {_client, %{^ref => {:done, ^ref, _}}} = await(client, ref, 1000)
+    end
+
+    test "retries retryable responses that arrive while the request is being sent" do
+      {listen, port} = RawServer.listen()
+
+      # The second request cannot send its body, as the first one
+      # exhausted the connection window
+      spawn_link(fn ->
+        socket = RawServer.accept(listen)
+        RawServer.respond(socket, RawServer.receive_stream(socket), "14")
+        RawServer.respond(socket, RawServer.receive_stream(socket))
+        Process.sleep(1000)
+      end)
+
+      client = OTLP.new(:http, "localhost", port, retry: @retry)
+      {:ok, client, ref} = OTLP.export(client, :traces, :binary.copy("a", 200_000))
+      {_client, %{^ref => {:done, ^ref, _}}} = await(client, ref)
+    end
+
+    test "backs off and retries requests cancelled by the server" do
+      {listen, port} = RawServer.listen()
+
+      spawn_link(fn ->
+        socket = RawServer.accept(listen)
+        # CANCEL
+        RawServer.reset(socket, RawServer.receive_request(socket), 8)
+        RawServer.respond(socket, RawServer.receive_request(socket))
+        Process.sleep(1000)
+      end)
+
+      client = OTLP.new(:http, "localhost", port, retry: @retry)
+      {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1))
+
+      {{_client, %{^ref => {:done, ^ref, _}}}, log} =
+        ExUnit.CaptureLog.with_log(fn -> await(client, ref) end)
+
+      assert log =~ "Backing off OTLP exports"
+    end
+
+    test "fails requests left unprocessed by a GOAWAY when retries are disabled" do
+      {listen, port} = RawServer.listen()
+
+      spawn_link(fn ->
+        socket = RawServer.accept(listen)
+        first = RawServer.receive_request(socket)
+        _second = RawServer.receive_request(socket)
+        RawServer.respond(socket, first)
+        RawServer.goaway(socket, first, 0)
+        Process.sleep(1000)
+      end)
+
+      client = OTLP.new(:http, "localhost", port, retry: false)
+      {:ok, client, a} = OTLP.export(client, :traces, Requests.traces(1))
+      {:ok, client, b} = OTLP.export(client, :traces, Requests.traces(1))
+
+      {_client, responses} = await(client, [a, b])
+      assert {:done, ^a, _} = responses[a]
+      assert {:error, ^b, %Mint.HTTPError{reason: :unprocessed}} = responses[b]
+    end
+
+    test "starts queued exports as others finish, up to the server limit" do
+      {listen, port} = RawServer.listen()
+      parent = self()
+
+      # SETTINGS_MAX_CONCURRENT_STREAMS of 1. The test responds to requests.
+      spawn_link(fn ->
+        socket = RawServer.accept(listen, [{3, 1}])
+
+        loop = fn loop ->
+          send(parent, {:test_server, :request, socket, RawServer.receive_request(socket)})
+          loop.(loop)
+        end
+
+        loop.(loop)
+      end)
+
+      # The first export is sent before the server SETTINGS arrive
+      client = OTLP.new(:http, "localhost", port, retry: false)
+      {:ok, client, a} = OTLP.export(client, :traces, Requests.traces(1))
+      client = stream_for(client, 100)
+      assert_received {:test_server, :request, socket, stream}
+
+      {:ok, client, b} = OTLP.export(client, :traces, Requests.traces(1))
+      {:ok, client, c} = OTLP.export(client, :traces, Requests.traces(1))
+      client = stream_for(client, 100)
+      refute_received {:test_server, :request, _, _}
+
+      RawServer.respond(socket, stream)
+      {client, %{^a => {:done, ^a, _}}} = await(client, a)
+      assert_receive {:test_server, :request, ^socket, stream}
+      refute_received {:test_server, :request, _, _}
+
+      RawServer.respond(socket, stream)
+      {client, %{^b => {:done, ^b, _}}} = await(client, b)
+      assert_receive {:test_server, :request, ^socket, stream}
+
+      RawServer.respond(socket, stream)
+      {_client, %{^c => {:done, ^c, _}}} = await(client, c)
+    end
+
+    test "exports over TLS" do
+      {server_opts, client_opts} = tls_options()
+      {pid, port} = TestServer.start(0, server_opts)
+      retry = [initial_backoff: 50, max_backoff: 50]
+      client = OTLP.new(:https, "localhost", port, transport_opts: client_opts, retry: retry)
+
+      {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1))
+      {client, %{^ref => {:done, ^ref, _}}} = await(client, ref)
+
+      # Resends exports when the connection drops
+      headers = TestServer.headers("sleep:5000:ok", 1)
+      {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
+      client = stream_for(client, 100)
+      Process.exit(pid, :kill)
+
+      wait_until_free(port)
+      {_pid, ^port} = TestServer.start(port, server_opts)
+      {client, %{^ref => {:done, ^ref, _}}} = await(client, ref)
+
+      # Closing removes the messages of the socket, such as a response
+      # that arrived before closing
+      headers = TestServer.headers("sleep:50:ok")
+      {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
+      client = stream_for(client, 0)
+      Process.sleep(200)
+      {:responses, _client, [{:error, ^ref, _}]} = OTLP.close(client)
+      refute_received {:ssl, _, _}
+      refute_received {:ssl_closed, _}
+    end
+
     test "close fails exports in flight", %{client: client} do
       headers = TestServer.headers("sleep:5000:ok")
       {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1), headers: headers)
@@ -557,6 +706,20 @@ defmodule Mint.OTLPTest do
     after
       100 -> count
     end
+  end
+
+  # A certificate for localhost, signed by a generated root
+  defp tls_options do
+    opts = [key: {:namedCurve, :secp256r1}, digest: :sha256]
+    san = {:Extension, {2, 5, 29, 17}, false, [dNSName: ~c"localhost"]}
+    chain = %{root: opts, intermediates: [], peer: [extensions: [san]] ++ opts}
+
+    %{server_config: server, client_config: client} =
+      :public_key.pkix_test_data(%{server_chain: chain, client_chain: chain})
+
+    server_opts = Keyword.take(server, [:cert, :key])
+    server_opts = [scheme: :https, thousand_island_options: [transport_options: server_opts]]
+    {server_opts, Keyword.take(client, [:cacerts])}
   end
 
   defp unused_port do

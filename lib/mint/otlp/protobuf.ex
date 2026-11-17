@@ -1,7 +1,6 @@
 defmodule Mint.OTLP.Protobuf do
-  @moduledoc false
-
   # Just enough protobuf decoding for OTLP and gRPC responses.
+  @moduledoc false
 
   import Bitwise
 
@@ -20,22 +19,17 @@ defmodule Mint.OTLP.Protobuf do
         int64 rejected_spans = 1;
         string error_message = 2;
       }
-
-  Returns `:error` if the message is malformed.
   """
   def decode_export_response(message) do
-    with {:ok, fields} <- decode_fields(message) do
-      case List.keyfind(fields, 1, 0) do
-        {1, partial_success} ->
-          with {:ok, fields} <- decode_fields(partial_success) do
-            {1, rejected} = List.keyfind(fields, 1, 0, {1, 0})
-            {2, error_message} = List.keyfind(fields, 2, 0, {2, ""})
-            {:ok, %{rejected: rejected, error_message: error_message}}
-          end
+    case List.keyfind(decode_fields(message), 1, 0) do
+      {1, partial_success} ->
+        fields = decode_fields(partial_success)
+        {1, rejected} = List.keyfind(fields, 1, 0, {1, 0})
+        {2, error_message} = List.keyfind(fields, 2, 0, {2, ""})
+        %{rejected: rejected, error_message: error_message}
 
-        nil ->
-          {:ok, %{rejected: 0, error_message: ""}}
-      end
+      nil ->
+        %{rejected: 0, error_message: ""}
     end
   end
 
@@ -63,72 +57,58 @@ defmodule Mint.OTLP.Protobuf do
         int32 nanos = 2;
       }
 
-  Returns `nil` if there is no retry delay.
+  Returns `nil` if there is no `RetryInfo`.
   """
   def decode_retry_after(status) do
-    case decode_fields(status) do
-      {:ok, fields} ->
-        Enum.find_value(fields, fn
-          {3, any} -> decode_retry_info(any)
-          _ -> nil
-        end)
-
-      :error ->
-        nil
-    end
+    Enum.find_value(decode_fields(status), fn
+      {3, any} -> decode_retry_info(decode_fields(any))
+      _ -> nil
+    end)
   end
 
   defp decode_retry_info(any) do
-    with {:ok, fields} <- decode_fields(any),
-         {1, @retry_info} <- List.keyfind(fields, 1, 0),
-         {2, retry_info} <- List.keyfind(fields, 2, 0),
-         {:ok, fields} <- decode_fields(retry_info),
-         {1, duration} <- List.keyfind(fields, 1, 0),
-         {:ok, fields} <- decode_fields(duration) do
-      {1, seconds} = List.keyfind(fields, 1, 0, {1, 0})
-      {2, nanos} = List.keyfind(fields, 2, 0, {2, 0})
-      seconds * 1000 + div(nanos, 1_000_000)
-    else
-      _ -> nil
+    case List.keyfind(any, 1, 0) do
+      {1, @retry_info} ->
+        {2, retry_info} = List.keyfind(any, 2, 0, {2, ""})
+        {1, duration} = List.keyfind(decode_fields(retry_info), 1, 0, {1, ""})
+        fields = decode_fields(duration)
+        {1, seconds} = List.keyfind(fields, 1, 0, {1, 0})
+        {2, nanos} = List.keyfind(fields, 2, 0, {2, 0})
+        seconds * 1000 + div(nanos, 1_000_000)
+
+      _ ->
+        nil
     end
   end
 
   # Decodes a message into a list of {field, value}, where value is an
   # integer for varint and fixed fields and a binary for length-delimited
-  # fields, or :error if the message is malformed.
+  # fields.
   defp decode_fields(binary), do: decode_fields(binary, [])
 
-  defp decode_fields(<<>>, acc), do: {:ok, Enum.reverse(acc)}
+  defp decode_fields(<<>>, acc), do: Enum.reverse(acc)
 
   defp decode_fields(binary, acc) do
-    with {:ok, key, rest} <- decode_varint(binary),
-         {:ok, value, rest} <- decode_value(key &&& 7, rest) do
-      decode_fields(rest, [{key >>> 3, value} | acc])
-    end
+    {key, rest} = decode_varint(binary)
+    {value, rest} = decode_value(key &&& 7, rest)
+    decode_fields(rest, [{key >>> 3, value} | acc])
   end
 
   defp decode_value(0, binary), do: decode_varint(binary)
-  defp decode_value(1, <<value::little-64, rest::binary>>), do: {:ok, value, rest}
-  defp decode_value(5, <<value::little-32, rest::binary>>), do: {:ok, value, rest}
+  defp decode_value(1, <<value::little-64, rest::binary>>), do: {value, rest}
+  defp decode_value(5, <<value::little-32, rest::binary>>), do: {value, rest}
 
   defp decode_value(2, binary) do
-    with {:ok, size, rest} <- decode_varint(binary),
-         <<value::binary-size(^size), rest::binary>> <- rest do
-      {:ok, value, rest}
-    else
-      _ -> :error
-    end
+    {size, rest} = decode_varint(binary)
+    <<value::binary-size(^size), rest::binary>> = rest
+    {value, rest}
   end
-
-  defp decode_value(_type, _binary), do: :error
 
   defp decode_varint(binary), do: decode_varint(binary, 0, 0)
 
-  defp decode_varint(<<1::1, value::7, rest::binary>>, shift, acc) when shift < 64,
+  defp decode_varint(<<1::1, value::7, rest::binary>>, shift, acc),
     do: decode_varint(rest, shift + 7, acc ||| value <<< shift)
 
   defp decode_varint(<<0::1, value::7, rest::binary>>, shift, acc),
-    do: {:ok, acc ||| value <<< shift, rest}
-
-  defp decode_varint(_binary, _shift, _acc), do: :error
+    do: {acc ||| value <<< shift, rest}
 end

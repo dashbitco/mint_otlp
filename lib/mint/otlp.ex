@@ -5,7 +5,9 @@ defmodule Mint.OTLP do
   This module exports traces, metrics, and logs to an OTLP endpoint,
   such as the OpenTelemetry Collector. Similar to `Mint.HTTP`, it does
   not spawn processes: a client is a data structure owned by a process,
-  which gives the messages it receives to `stream/2`.
+  which gives the messages it receives to `stream/2`. The client also
+  sends messages to itself, for its timers, so it must only be used by
+  the process that owns it, and all messages must be given to `stream/2`.
 
   It takes care of connecting, retrying, and reconnecting, as defined
   by the OTLP specification and configured when creating the client.
@@ -54,9 +56,15 @@ defmodule Mint.OTLP do
   exponential with jitter, respects the delay given by the server, if
   any, and resets once an export succeeds.
 
-  Exports that do not succeed within `:max_elapsed_time` fail. If they
-  are waiting to be sent, they fail with the last error the client got
-  since an export last succeeded, or with `DEADLINE_EXCEEDED` if none.
+  Exports in flight when the connection closes are sent again on a new
+  connection. As the server may have processed them, an export may be
+  received more than once.
+
+  Exports that do not succeed within `:max_elapsed_time` fail, although
+  an attempt in flight at that time runs until it gets a response or
+  reaches `:timeout`. If they are waiting to be sent, they fail with the
+  last error the client got since an export last succeeded, or with
+  `DEADLINE_EXCEEDED` if none.
 
   Failures that lead to retries are logged at the info level, and
   dropped exports at the error level.
@@ -133,8 +141,9 @@ defmodule Mint.OTLP do
         or retried, in milliseconds. Defaults to `300_000`
 
       Without retries, exports fail on their first failure, or if they
-      cannot be sent within `:timeout`. The backoff options still apply
-      to reconnects.
+      cannot be sent within `:timeout`. The client still backs off after
+      retryable failures and failed connections, as described in the
+      "Retries" section of the module docs.
 
   Other options are given to `Mint.HTTP2.connect/4`, except for `:mode`,
   which is always `:active`. Connecting blocks the calling process, so

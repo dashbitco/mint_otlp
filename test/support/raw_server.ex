@@ -31,6 +31,17 @@ defmodule Mint.OTLP.RawServer do
     end
   end
 
+  @doc """
+  Receives frames until a request starts, returning its stream id,
+  without waiting for its body.
+  """
+  def receive_stream(socket) do
+    case receive_frame(socket) do
+      {1, _flags, stream, _payload} -> stream
+      {_type, _flags, _stream, _payload} -> receive_stream(socket)
+    end
+  end
+
   defp receive_frame(socket) do
     {:ok, <<size::24, type::8, flags::8, _::1, stream::31>>} = :gen_tcp.recv(socket, 9, 5000)
     payload = if size > 0, do: elem(:gen_tcp.recv(socket, size), 1), else: ""

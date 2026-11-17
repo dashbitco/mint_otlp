@@ -77,7 +77,7 @@ defmodule Mint.OTLP.GRPC do
     queue: :queue.new(),
     # Whether a message to run the client was sent
     run?: false,
-    # Failures since the last response, and until when to back off
+    # Failures since the last success, and until when to back off
     failures: 0,
     backoff_until: nil,
     # The last failure since the last success, for logs and for exports
@@ -199,21 +199,21 @@ defmodule Mint.OTLP.GRPC do
     if client.conn, do: close_connection(client)
 
     error = %Mint.TransportError{reason: :closed}
-
-    {client, acc} =
-      finish_all(client, Map.keys(client.exports), [], &finish(&1, &2, {:error, &2, error}, &3))
+    responses = for ref <- Map.keys(client.exports), do: {:error, ref, error}
 
     client = %{
       client
       | conn: nil,
-        run?: false,
+        exports: %{},
+        streams: %{},
+        queue: :queue.new(),
         failures: 0,
         backoff_until: nil,
         last_error: nil,
         timer: nil
     }
 
-    {:responses, client, Enum.reverse(acc)}
+    {:responses, client, responses}
   end
 
   ## Steps
@@ -343,7 +343,7 @@ defmodule Mint.OTLP.GRPC do
   ## Timers
 
   # Arms the timer for the earliest time the client has something to
-  # do, if it changed. `nil` sorts after integers, so it means never.
+  # do. `nil` sorts after integers, so it means never.
   defp schedule(client) do
     at =
       Enum.reduce(client.exports, client.backoff_until, fn
@@ -385,8 +385,7 @@ defmodule Mint.OTLP.GRPC do
         # dead, or the server is too slow, so we also back off
         now - client.received_at >= client.timeout ->
           error = %Mint.TransportError{reason: :timeout}
-          {client, acc} = drop_connection(client, error, acc)
-          {back_off(client, error), acc}
+          client |> back_off(error) |> drop_connection(error, acc)
 
         true ->
           error = error(:deadline_exceeded, "no response after #{client.timeout}ms")
@@ -510,26 +509,15 @@ defmodule Mint.OTLP.GRPC do
       else: :fail
   end
 
-  # The server did not process requests refused with REFUSED_STREAM or
-  # beyond its limit, but they would be sent again on the same connection,
-  # so we back off. CANCEL maps to CANCELLED in gRPC.
+  # The server did not process requests refused with REFUSED_STREAM, but
+  # they would be sent again on the same connection, so we back off.
+  # CANCEL maps to CANCELLED in gRPC.
   defp classify(%Mint.HTTPError{reason: {:server_closed_request, :refused_stream}}), do: :back_off
   defp classify(%Mint.HTTPError{reason: {:server_closed_request, :cancel}}), do: :back_off
-  defp classify(%Mint.HTTPError{reason: :too_many_concurrent_requests}), do: :back_off
   defp classify(error), do: if(connection_error?(error), do: :requeue, else: :fail)
 
   defp connection_error?(%Mint.TransportError{}), do: true
-
-  defp connection_error?(%Mint.HTTPError{reason: reason}) do
-    case reason do
-      :closed -> true
-      :closed_for_writing -> true
-      :unprocessed -> true
-      {:server_closed_connection, _, _} -> true
-      _ -> false
-    end
-  end
-
+  defp connection_error?(%Mint.HTTPError{reason: :unprocessed}), do: true
   defp connection_error?(_error), do: false
 
   defp retry_after(%Error{retry_after: retry_after}) when retry_after != nil, do: retry_after
@@ -724,10 +712,7 @@ defmodule Mint.OTLP.GRPC do
   defp result(request) do
     case List.keyfind(request.response_headers, "grpc-status", 0) do
       {_, "0"} when request.status == 200 ->
-        case decode_response(request.data) do
-          {:ok, partial_success} -> {:ok, partial_success}
-          :error -> {:error, error(:internal, "malformed response message")}
-        end
+        {:ok, decode_response(request.data)}
 
       {_, status} when status != "0" ->
         code =
@@ -764,7 +749,7 @@ defmodule Mint.OTLP.GRPC do
   end
 
   defp error(code, message, retry_after \\ nil) do
-    %Error{transport: __MODULE__, code: code, message: message, retry_after: retry_after}
+    %Error{transport: :grpc, code: code, message: message, retry_after: retry_after}
   end
 
   defp grpc_message(headers) do
@@ -782,17 +767,14 @@ defmodule Mint.OTLP.GRPC do
     case IO.iodata_to_binary(data) do
       <<>> -> Protobuf.decode_export_response(<<>>)
       <<0, size::32, message::binary-size(size)>> -> Protobuf.decode_export_response(message)
-      _ -> :error
     end
   end
 
   # The retry delay comes in the google.rpc.Status of grpc-status-details-bin.
   defp retry_after_header(headers) do
-    with {_, details} <- List.keyfind(headers, "grpc-status-details-bin", 0),
-         {:ok, status} <- Base.decode64(details, padding: false) do
-      Protobuf.decode_retry_after(status)
-    else
-      _ -> nil
+    case List.keyfind(headers, "grpc-status-details-bin", 0) do
+      {_, details} -> Protobuf.decode_retry_after(Base.decode64!(details, padding: false))
+      nil -> nil
     end
   end
 end

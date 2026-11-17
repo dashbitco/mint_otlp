@@ -5,7 +5,7 @@ defmodule Mint.OTLP.Error do
 
   The public fields are:
 
-    * `:transport` - the module of the transport that returned the error
+    * `:transport` - the transport that returned the error, such as `:grpc`
 
     * `:code` - the error code, specific to the transport. With the
       `:grpc` transport, it is a gRPC status code, see `t:grpc_code/0`
@@ -41,7 +41,7 @@ defmodule Mint.OTLP.Error do
           | :unauthenticated
 
   @type t() :: %__MODULE__{
-          transport: module(),
+          transport: :grpc,
           code: term(),
           message: String.t(),
           retry_after: non_neg_integer() | nil

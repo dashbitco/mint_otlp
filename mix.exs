@@ -2,7 +2,7 @@ defmodule Mint.OTLP.MixProject do
   use Mix.Project
 
   @version "0.1.0-dev"
-  @repo_url "https://github.com/elixir-mint/mint_otlp"
+  @repo_url "https://github.com/dashbitco/mint_otlp"
 
   def project do
     [
