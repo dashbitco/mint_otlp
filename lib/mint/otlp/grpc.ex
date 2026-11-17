@@ -118,9 +118,7 @@ defmodule Mint.OTLP.GRPC do
     size = Keyword.get_lazy(opts, :size, fn -> IO.iodata_length(request) end)
     headers = client.headers ++ timeout_header(opts[:timeout]) ++ Keyword.get(opts, :headers, [])
 
-    # An iovec is a flat list of binaries, which we can split when sending
-    # without copying. Building it only copies small binaries.
-    body = [<<0, size::32>> | :erlang.iolist_to_iovec(request)]
+    body = [<<0, size::32>> | request]
     size = size + 5
 
     if fits_one_frame?(client.conn, size) do
@@ -297,17 +295,23 @@ defmodule Mint.OTLP.GRPC do
 
   defp drop(client, ref), do: %{client | requests: Map.delete(client.requests, ref)}
 
-  # Splits a flat list of binaries after `size` bytes, without copying.
+  # Splits iodata after `size` bytes. While the head of the list is a
+  # binary, we split it into sub-binaries to avoid copying the payload.
+  # Anything else is converted to an iovec, so it happens at most once.
   defp split(rest, 0, acc), do: {Enum.reverse(acc), rest}
 
-  defp split([binary | rest], size, acc) when byte_size(binary) <= size,
+  # Only if :size was larger than the request
+  defp split([], _size, acc), do: {Enum.reverse(acc), []}
+
+  defp split([binary | rest], size, acc) when is_binary(binary) and byte_size(binary) <= size,
     do: split(rest, size - byte_size(binary), [binary | acc])
 
-  defp split([binary | rest], size, acc) do
-    head = binary_part(binary, 0, size)
-    tail = binary_part(binary, size, byte_size(binary) - size)
+  defp split([binary | rest], size, acc) when is_binary(binary) do
+    {head, tail} = :erlang.split_binary(binary, size)
     {Enum.reverse([head | acc]), [tail | rest]}
   end
+
+  defp split(iodata, size, acc), do: split(:erlang.iolist_to_iovec(iodata), size, acc)
 
   ## Responses
 

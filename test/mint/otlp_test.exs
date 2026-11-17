@@ -83,6 +83,33 @@ defmodule Mint.OTLPTest do
       assert body == IO.iodata_to_binary([<<0, size::32>> | request])
     end
 
+    test "sends large requests given as any iodata", %{client: client} do
+      [first | rest] = Requests.traces(1_000)
+      binary = IO.iodata_to_binary([first | rest])
+      assert byte_size(binary) > 100_000
+
+      # Nested lists, bytes as integers, and improper lists ending in binaries
+      nested =
+        rest
+        |> Enum.chunk_every(7)
+        |> Enum.map(fn [head | tail] -> [[head] | IO.iodata_to_binary(tail)] end)
+        |> then(&[:binary.bin_to_list(first), [] | &1])
+
+      assert IO.iodata_to_binary(nested) == binary
+
+      for request <- [binary, nested], reduce: client do
+        client ->
+          {:ok, client, ref} =
+            OTLP.export(client, :traces, request, headers: TestServer.headers())
+
+          {client, %{^ref => {:ok, ^ref, _}}} = await(client, ref)
+
+          assert_receive {:test_server, _, _, body}
+          assert body == <<0, byte_size(binary)::32, binary::binary>>
+          client
+      end
+    end
+
     test "sends concurrent large requests", %{client: client} do
       requests = for i <- 1..5, do: Requests.traces(2_000, name: "span #{i}")
 
