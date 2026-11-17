@@ -8,7 +8,7 @@ defmodule Mint.OTLP.GRPC do
   require Logger
 
   alias Mint.HTTP2
-  alias Mint.OTLP.{Error, Protobuf}
+  alias Mint.OTLP.{Decoder, Error}
 
   @paths %{
     traces: "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
@@ -765,15 +765,15 @@ defmodule Mint.OTLP.GRPC do
   # The response is a single message, which may be omitted when empty.
   defp decode_response(data) do
     case IO.iodata_to_binary(data) do
-      <<>> -> Protobuf.decode_export_response(<<>>)
-      <<0, size::32, message::binary-size(size)>> -> Protobuf.decode_export_response(message)
+      <<>> -> Decoder.decode_export_response(<<>>)
+      <<0, size::32, message::binary-size(size)>> -> Decoder.decode_export_response(message)
     end
   end
 
   # The retry delay comes in the google.rpc.Status of grpc-status-details-bin.
   defp retry_after_header(headers) do
     case List.keyfind(headers, "grpc-status-details-bin", 0) do
-      {_, details} -> Protobuf.decode_retry_after(Base.decode64!(details, padding: false))
+      {_, details} -> Decoder.decode_retry_after(Base.decode64!(details, padding: false))
       nil -> nil
     end
   end

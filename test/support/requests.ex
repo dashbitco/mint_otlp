@@ -4,13 +4,25 @@ defmodule Mint.OTLP.Requests do
   """
   import Bitwise
 
+  alias Mint.OTLP.Encoder
+
   @doc """
   An `ExportTraceServiceRequest` with `count` spans, as a list of binaries.
   """
   def traces(count, opts \\ []) do
     name = Keyword.get(opts, :name, "GET /users/:id")
-    spans = for _ <- 1..count//1, do: field(2, span(name))
-    [field(1, [resource(), field(2, [scope(), spans])])] |> to_iovec()
+    now = System.os_time(:nanosecond)
+    attributes = [{"http.route", "/users/:id"}, {"http.response.status_code", 200}]
+
+    spans =
+      for _ <- 1..count//1 do
+        trace_id = :rand.bytes(16)
+        span_id = :rand.bytes(8)
+        Encoder.span(trace_id, span_id, name, now - 1_000_000, now, attributes: attributes)
+      end
+
+    {:traces, request} = Encoder.traces(resource(), [{scope(), spans}])
+    to_iovec(request)
   end
 
   @doc """
@@ -32,32 +44,14 @@ defmodule Mint.OTLP.Requests do
     [field(1, [resource(), field(2, [scope(), field(2, record)])])] |> to_iovec()
   end
 
-  defp span(name) do
-    now = System.os_time(:nanosecond)
-
-    [
-      bytes(1, :rand.bytes(16)),
-      bytes(2, :rand.bytes(8)),
-      string(5, name),
-      <<0x30, 2>>,
-      <<0x39, now - 1_000_000::little-64, 0x41, now::little-64>>,
-      field(9, [string(1, "http.route"), field(2, string(1, "/users/:id"))]),
-      field(9, [string(1, "http.response.status_code"), field(2, [0x18, varint(200)])])
-    ]
-  end
-
-  defp resource do
-    field(1, field(1, [string(1, "service.name"), field(2, string(1, "mint_otlp_test"))]))
-  end
-
-  defp scope, do: field(1, [string(1, "mint_otlp"), string(2, "0.1.0")])
+  defp resource, do: Encoder.resource(%{"service.name" => "mint_otlp_test"})
+  defp scope, do: Encoder.scope("mint_otlp", version: "0.1.0")
 
   defp to_iovec(iodata), do: :erlang.iolist_to_iovec(iodata)
 
   defp field(number, iodata),
     do: [varint(number <<< 3 ||| 2), varint(IO.iodata_length(iodata)), iodata]
 
-  defp bytes(number, binary), do: field(number, binary)
   defp string(number, binary), do: field(number, binary)
 
   defp varint(n) when n < 128, do: <<n>>

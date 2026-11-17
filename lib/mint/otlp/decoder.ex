@@ -1,4 +1,4 @@
-defmodule Mint.OTLP.Protobuf do
+defmodule Mint.OTLP.Decoder do
   # Just enough protobuf decoding for OTLP and gRPC responses.
   @moduledoc false
 

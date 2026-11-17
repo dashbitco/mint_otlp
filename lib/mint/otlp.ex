@@ -12,8 +12,8 @@ defmodule Mint.OTLP do
   It takes care of connecting, retrying, and reconnecting, as defined
   by the OTLP specification and configured when creating the client.
 
-  `Mint.OTLP` does not encode telemetry. `export/4` takes a request,
-  such as an `ExportTraceServiceRequest`, already encoded as protobuf.
+  `export/3` takes requests already encoded as protobuf, such as the ones
+  built with `Mint.OTLP.Encoder`.
 
   ## Transports
 
@@ -24,7 +24,8 @@ defmodule Mint.OTLP do
   ## Usage
 
       client = Mint.OTLP.new(:http, "localhost", 4317)
-      {:ok, client, ref} = Mint.OTLP.export(client, :traces, request)
+      request = Mint.OTLP.Encoder.traces(resource, [{scope, spans}])
+      {:ok, client, ref} = Mint.OTLP.export(client, request)
 
       # In a loop, until the response arrives
       receive do
@@ -81,6 +82,14 @@ defmodule Mint.OTLP do
   The kind of telemetry.
   """
   @type signal() :: :traces | :metrics | :logs
+
+  @typedoc """
+  An encoded request for a signal, such as returned by `Mint.OTLP.Encoder.traces/2`.
+
+  The request is an `ExportTraceServiceRequest`, `ExportMetricsServiceRequest`,
+  or `ExportLogsServiceRequest` encoded as protobuf, according to the signal.
+  """
+  @type request() :: {signal(), iodata()}
 
   @typedoc """
   An error.
@@ -160,10 +169,7 @@ defmodule Mint.OTLP do
   end
 
   @doc """
-  Exports an encoded request for the given signal.
-
-  `request` is an `ExportTraceServiceRequest`, `ExportMetricsServiceRequest`,
-  or `ExportLogsServiceRequest` encoded as protobuf, according to `signal`.
+  Exports an encoded request, see `t:request/0`.
 
   `{:ok, client, ref}` means the export started, not that the request was
   sent. Its outcome always arrives later as a response from `stream/2`
@@ -172,19 +178,19 @@ defmodule Mint.OTLP do
 
   The request body is sent as the HTTP/2 flow control windows allow,
   with what is left sent as `stream/2` receives window updates. Binaries
-  in `request` are not copied, except for small ones.
+  in the request are not copied, except for small ones.
 
   ## Options
 
-    * `:size` - the size of `request`, if already known, to avoid
-      computing it
+    * `:size` - the size of the encoded request, if already known, to
+      avoid computing it
 
     * `:headers` - headers for this export, in addition to the ones
       given to `new/4`
 
   """
-  @spec export(t(), signal(), iodata(), keyword()) :: {:ok, t(), reference()}
-  def export(%module{} = client, signal, request, opts \\ [])
+  @spec export(t(), request(), keyword()) :: {:ok, t(), reference()}
+  def export(%module{} = client, {signal, request}, opts \\ [])
       when signal in [:traces, :metrics, :logs] do
     module.export(client, signal, request, opts)
   end

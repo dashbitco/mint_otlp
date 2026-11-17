@@ -6,7 +6,8 @@ Like Mint, it is processless: a client is a data structure owned by a process, w
 
 ```elixir
 client = Mint.OTLP.new(:http, "localhost", 4317)
-{:ok, client, ref} = Mint.OTLP.export(client, :traces, encoded_request)
+request = Mint.OTLP.Encoder.traces(resource, [{scope, spans}])
+{:ok, client, ref} = Mint.OTLP.export(client, request)
 
 # In a loop, until responses has {:done, ^ref, %{rejected: 0, error_message: ""}}
 receive do
