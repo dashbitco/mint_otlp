@@ -1,0 +1,13 @@
+# The OpenTelemetry Collector, used by the integration tests:
+#
+#     docker compose up -d
+#     mix test --include integration
+#
+services:
+  collector:
+    image: otel/opentelemetry-collector:0.115.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./test/support/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
