@@ -4,6 +4,16 @@ receivers:
       grpc:
         endpoint: 0.0.0.0:4317
 
+  # Sends a graceful GOAWAY every second
+  otlp/max_connection_age:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4319
+        keepalive:
+          server_parameters:
+            max_connection_age: 1s
+            max_connection_age_grace: 30s
+
 exporters:
   debug:
     verbosity: basic
@@ -11,7 +21,7 @@ exporters:
 service:
   pipelines:
     traces:
-      receivers: [otlp]
+      receivers: [otlp, otlp/max_connection_age]
       exporters: [debug]
     metrics:
       receivers: [otlp]

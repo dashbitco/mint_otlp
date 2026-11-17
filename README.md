@@ -2,15 +2,16 @@
 
 Small and composable [OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/) client, built on top of [Mint](https://github.com/elixir-mint/mint).
 
-Like Mint, it is processless: a client is a data structure that wraps a socket, and the messages the socket sends to the owner process are given to `Mint.OTLP.stream/2`. It does not encode telemetry, it exports requests already encoded as protobuf.
+Like Mint, it is processless: a client is a data structure owned by a process, which gives the messages it receives to `Mint.OTLP.stream/2`. It does not encode telemetry, it exports requests already encoded as protobuf. It connects lazily, retries failed exports, and reconnects, as defined by the OTLP specification.
 
 ```elixir
-{:ok, client} = Mint.OTLP.connect(:http, "localhost", 4317)
+client = Mint.OTLP.new(:http, "localhost", 4317)
 {:ok, client, ref} = Mint.OTLP.export(client, :traces, encoded_request)
 
+# In a loop, until responses has {:done, ^ref, %{rejected: 0, error_message: ""}}
 receive do
   message ->
-    {:ok, client, [{:ok, ^ref, %{rejected: 0}}]} = Mint.OTLP.stream(client, message)
+    {:responses, client, responses} = Mint.OTLP.stream(client, message)
 end
 ```
 

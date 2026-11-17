@@ -10,7 +10,7 @@ defmodule Mint.OTLP.CollectorTest do
   @moduletag :integration
 
   setup do
-    {:ok, client} = OTLP.connect(:http, "localhost", 4317)
+    client = OTLP.new(:http, "localhost", 4317)
     %{client: client}
   end
 
@@ -20,9 +20,9 @@ defmodule Mint.OTLP.CollectorTest do
     {:ok, client, logs} = OTLP.export(client, :logs, Requests.logs())
 
     {_client, responses} = await(client, [traces, metrics, logs])
-    assert responses[traces] == {:ok, traces, %{rejected: 0, error_message: ""}}
-    assert responses[metrics] == {:ok, metrics, %{rejected: 0, error_message: ""}}
-    assert responses[logs] == {:ok, logs, %{rejected: 0, error_message: ""}}
+    assert responses[traces] == {:done, traces, %{rejected: 0, error_message: ""}}
+    assert responses[metrics] == {:done, metrics, %{rejected: 0, error_message: ""}}
+    assert responses[logs] == {:done, logs, %{rejected: 0, error_message: ""}}
   end
 
   test "exports large and concurrent requests", %{client: client} do
@@ -33,9 +33,8 @@ defmodule Mint.OTLP.CollectorTest do
         {ref, client}
       end)
 
-    {client, responses} = await(client, refs, 30_000)
-    assert Enum.all?(responses, &match?({_, {:ok, _, %{rejected: 0}}}, &1))
-    assert OTLP.open_request_count(client) == 0
+    {_client, responses} = await(client, refs, 30_000)
+    assert Enum.all?(responses, &match?({_, {:done, _, %{rejected: 0}}}, &1))
   end
 
   test "rejects requests above the maximum message size", %{client: client} do
@@ -43,7 +42,6 @@ defmodule Mint.OTLP.CollectorTest do
 
     {_client, %{^ref => {:error, ^ref, error}}} = await(client, ref, 30_000)
     assert error.code == :resource_exhausted
-    refute OTLP.retryable?(error)
   end
 
   test "rejects malformed requests", %{client: client} do
@@ -51,6 +49,19 @@ defmodule Mint.OTLP.CollectorTest do
 
     {_client, %{^ref => {:error, ^ref, error}}} = await(client, ref)
     assert error.code in [:internal, :invalid_argument]
-    refute OTLP.retryable?(error)
+  end
+
+  test "keeps exporting across graceful GOAWAYs" do
+    # This receiver closes connections every second, see collector.yaml
+    # Requests still sending their body when the GOAWAY arrives are retried
+    client = OTLP.new(:http, "localhost", 4319, retry: [initial_backoff: 10, max_backoff: 100])
+
+    Enum.reduce(1..30, client, fn _, client ->
+      {:ok, client, ref} = OTLP.export(client, :traces, Requests.traces(1_000))
+      {client, %{^ref => response}} = await(client, ref)
+      assert {:done, ^ref, %{rejected: 0}} = response
+      Process.sleep(100)
+      client
+    end)
   end
 end

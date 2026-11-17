@@ -1,27 +1,100 @@
 defmodule Mint.OTLP.GRPC do
+  @user_agent "mint-otlp/#{Mix.Project.config()[:version]}"
+
   @moduledoc """
   OTLP/gRPC transport.
 
   Each export is a unary gRPC call to the `Export` method of the
-  signal's service, over a `Mint.HTTP2` connection. Use the functions
-  in `Mint.OTLP` to work with it.
+  signal's service, over a single `Mint.HTTP2` connection. Use the
+  functions in `Mint.OTLP` to work with it.
+
+  ## Options
+
+    * `:headers` - headers to send with every export, such as
+      `authorization`
+
+    * `:user_agent` - the `user-agent` header. The OTLP specification
+      recommends identifying the exporter and its version. Defaults to
+      `"#{@user_agent}"`
+
+    * `:timeout` - how long to wait for the response to each attempt,
+      in milliseconds, also sent to the server as `grpc-timeout`. It
+      also sets how quickly dead connections are detected and is used
+      as the `:send_timeout` of the socket, unless one is given in
+      `:transport_opts`. Defaults to `10_000`
+
+    * `:retry` - `false` to disable retries, `true` for the defaults,
+      or a keyword list with:
+
+      * `:initial_backoff` - the delay before the first retry, in
+        milliseconds. Defaults to `5_000`
+
+      * `:max_backoff` - the maximum delay between retries, in
+        milliseconds. Defaults to `30_000`
+
+      * `:max_elapsed_time` - for how long an export may wait to be sent
+        or retried, in milliseconds. Defaults to `300_000`
+
+      Without retries, exports fail on their first failure, or if they
+      cannot be sent within `:timeout`. The backoff options still apply
+      to reconnects.
+
+  Other options are given to `Mint.HTTP2.connect/4`, except for `:mode`,
+  which is always `:active`. Connecting blocks the calling process, so
+  consider giving a `:timeout` in `:transport_opts`.
+
+  ## Retries
+
+  As defined by the OTLP specification, failed exports are retried
+  when the server returns `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`,
+  `OUT_OF_RANGE`, `UNAVAILABLE`, or `DATA_LOSS`, or `RESOURCE_EXHAUSTED`
+  with a retry delay, and when an attempt times out. These failures are
+  about the server, so the whole client backs off: no export starts and
+  no connection is attempted until the backoff ends. Backoff is
+  exponential with jitter, respects the delay given by the server, if
+  any, and resets once an export succeeds.
+
+  Requests left unprocessed by a GOAWAY, and requests in flight when
+  the connection closes, are sent again on a new connection, without
+  backing off. As the server may have processed some of them, an export
+  may be received more than once. The first reconnect after an export
+  succeeded is immediate, and the following ones back off. Requests the
+  server refuses, with REFUSED_STREAM, are retried after backing off,
+  as the connection remains. When the server sends a GOAWAY, no new
+  exports start on the connection, and the ones the server is
+  processing may still finish. Once they do, the others start on a new
+  connection.
+
+  Exports that do not succeed within `:max_elapsed_time` fail. If they
+  are waiting to be sent, they fail with the last error the client got
+  since an export last succeeded, or with `DEADLINE_EXCEEDED` if none.
+
+  Backoffs and connections closed with exports in flight are logged at
+  the info level, and exports the client gives up on at the error level.
+
+  ## Dead connections
+
+  A connection may stop working without being closed. When an export
+  gets no response within `:timeout`, if the server sent nothing on the
+  connection during that time, the connection is considered dead and
+  closed, and its exports are sent again on a new one. Otherwise, only
+  that export is cancelled and retried.
 
   ## Flow control
 
   `Mint.HTTP2` keeps track of the HTTP/2 flow control windows but never
-  waits on them. This module sends as much of a request body as both the
-  connection and the request windows allow, which `Mint.HTTP2` splits
-  into frames, and keeps the rest of the body until `Mint.OTLP.stream/2`
-  processes WINDOW_UPDATE frames from the server. Requests are sent in
-  the order they were exported.
+  waits on them. A request that fits the windows is sent at once.
+  Otherwise, this module sends as much of the body as the windows allow,
+  which `Mint.HTTP2` splits into frames, and the rest as WINDOW_UPDATE
+  frames arrive.
   """
 
   @behaviour Mint.OTLP
 
+  require Logger
+
   alias Mint.HTTP2
   alias Mint.OTLP.{Error, Protobuf}
-
-  @user_agent "mint-otlp/#{Mix.Project.config()[:version]}"
 
   @paths %{
     traces: "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
@@ -48,7 +121,21 @@ defmodule Mint.OTLP.GRPC do
     16 => :unauthenticated
   }
 
+  @retryable_codes [
+    :cancelled,
+    :deadline_exceeded,
+    :aborted,
+    :out_of_range,
+    :unavailable,
+    :data_loss
+  ]
+
   @retry_info "type.googleapis.com/google.rpc.RetryInfo"
+
+  @retry_defaults [initial_backoff: 5_000, max_backoff: 30_000, max_elapsed_time: 300_000]
+
+  # Large writes block the owner and may exceed the socket send timeout
+  @max_write 128 * 1024
 
   @typedoc """
   A gRPC status code other than `OK`, the `:code` of `Mint.OTLP.Error`.
@@ -71,223 +158,602 @@ defmodule Mint.OTLP.GRPC do
           | :data_loss
           | :unauthenticated
 
-  @opaque t() :: %__MODULE__{
-            conn: HTTP2.t(),
-            headers: Mint.Types.headers(),
-            requests: %{reference() => map()},
-            sending: :queue.queue(reference())
-          }
+  @opaque t() :: %__MODULE__{}
 
-  defstruct [:conn, headers: [], requests: %{}, sending: :queue.new()]
+  # Each export is either :queued, in `queue`, or {:in_flight, request},
+  # sent or being sent as `request.stream`, which is indexed in `streams`.
+  # Exports leave `exports` only in finish/4, which returns their response.
+  #
+  # Retryable failures are about the server or the connection, rather
+  # than a particular export, so they make the whole client back off.
+  #
+  # A single timer wakes the client at the earliest of `backoff_until`,
+  # the deadlines of requests in flight, and when queued exports expire.
+  defstruct [
+    :id,
+    :scheme,
+    :address,
+    :port,
+    :connect_opts,
+    :headers,
+    :timeout,
+    :backoff,
+    # nil if retries are disabled
+    :max_elapsed_time,
+    conn: nil,
+    exports: %{},
+    streams: %{},
+    queue: :queue.new(),
+    # Whether a message to run the client was sent
+    run?: false,
+    # Failures since the last response, and until when to back off
+    failures: 0,
+    backoff_until: nil,
+    # The last failure since the last success, for logs and for exports
+    # that expire in the queue
+    last_error: nil,
+    # When the server last sent anything on the connection
+    received_at: nil,
+    timer: nil
+  ]
 
-  @doc """
-  Connects to an OTLP/gRPC endpoint.
-
-  Use the `:http` scheme for HTTP/2 with prior knowledge, which is
-  what OTLP/gRPC uses without TLS, and `:https` otherwise.
-
-  ## Options
-
-    * `:headers` - headers to send with every export, such as
-      `authorization`
-
-    * `:user_agent` - the `user-agent` header. The OTLP specification
-      recommends identifying the exporter and its version. Defaults to
-      `"#{@user_agent}"`
-
-  Other options are given to `Mint.HTTP2.connect/4`.
-  """
   @impl Mint.OTLP
-  def connect(scheme, address, port, opts) do
+  def new(scheme, address, port, opts) do
     {headers, opts} = Keyword.pop(opts, :headers, [])
     {user_agent, opts} = Keyword.pop(opts, :user_agent, @user_agent)
+    {timeout, opts} = Keyword.pop(opts, :timeout, 10_000)
+    {retry, opts} = Keyword.pop(opts, :retry, true)
 
-    with {:ok, conn} <- HTTP2.connect(scheme, address, port, opts) do
-      headers = [
+    if not (is_integer(timeout) and timeout > 0) do
+      raise ArgumentError, ":timeout must be a positive integer, got: #{inspect(timeout)}"
+    end
+
+    options = Map.new(Keyword.merge(@retry_defaults, if(is_list(retry), do: retry, else: [])))
+
+    # Writes to a server that stopped reading would block forever
+    transport_opts =
+      Keyword.merge(
+        [send_timeout: timeout, send_timeout_close: true],
+        Keyword.get(opts, :transport_opts, [])
+      )
+
+    %__MODULE__{
+      id: make_ref(),
+      scheme: scheme,
+      address: address,
+      port: port,
+      connect_opts: Keyword.merge(opts, mode: :active, transport_opts: transport_opts),
+      headers: [
         {"content-type", "application/grpc"},
         {"te", "trailers"},
-        {"user-agent", user_agent} | headers
-      ]
-
-      {:ok, %__MODULE__{conn: conn, headers: headers}}
-    end
+        {"user-agent", user_agent},
+        {"grpc-timeout", grpc_timeout(timeout)} | headers
+      ],
+      timeout: timeout,
+      backoff: Map.take(options, [:initial_backoff, :max_backoff]),
+      max_elapsed_time: if(retry, do: options.max_elapsed_time)
+    }
   end
 
+  # grpc-timeout allows at most 8 digits
+  defp grpc_timeout(timeout) when timeout < 100_000_000, do: "#{timeout}m"
+  defp grpc_timeout(timeout), do: "#{min(div(timeout, 1000), 99_999_999)}S"
+
+  # Exports only enqueue and send a message to run the client, once
+  # per burst of exports. All work happens in stream/2, so every
+  # response comes from stream/2 and export/4 never blocks.
   @impl Mint.OTLP
   def export(%__MODULE__{} = client, signal, request, opts) do
+    ref = make_ref()
     size = Keyword.get_lazy(opts, :size, fn -> IO.iodata_length(request) end)
-    headers = client.headers ++ timeout_header(opts[:timeout]) ++ Keyword.get(opts, :headers, [])
 
-    body = [<<0, size::32>> | request]
-    size = size + 5
+    export = %{
+      path: Map.fetch!(@paths, signal),
+      headers: client.headers ++ Keyword.get(opts, :headers, []),
+      body: [<<0, size::32>> | request],
+      frame_size: size + 5,
+      expires_at: now() + (client.max_elapsed_time || client.timeout),
+      state: :queued
+    }
 
-    if fits_window?(client.conn, size) do
-      case HTTP2.request(client.conn, "POST", @paths[signal], headers, body) do
-        {:ok, conn, ref} -> {:ok, put_request(%{client | conn: conn}, ref, [], 0), ref}
-        {:error, conn, error} -> {:error, %{client | conn: conn}, error}
-      end
-    else
-      case HTTP2.request(client.conn, "POST", @paths[signal], headers, :stream) do
-        {:ok, conn, ref} ->
-          client = put_request(%{client | conn: conn}, ref, body, size)
+    client = %{
+      client
+      | exports: Map.put(client.exports, ref, export),
+        queue: :queue.in(ref, client.queue)
+    }
 
-          case send_body(client, ref) do
-            {:sent, client, []} ->
-              {:ok, client, ref}
-
-            {:blocked, client} ->
-              {:ok, %{client | sending: :queue.in(ref, client.sending)}, ref}
-
-            {:sent, client, [{:error, ^ref, error}]} ->
-              {:error, client, error}
-          end
-
-        {:error, conn, error} ->
-          {:error, %{client | conn: conn}, error}
-      end
-    end
-  end
-
-  defp timeout_header(nil), do: []
-  defp timeout_header(timeout) when is_integer(timeout), do: [{"grpc-timeout", "#{timeout}m"}]
-
-  defp fits_window?(conn, size) do
-    size <= HTTP2.get_window_size(conn, :connection) and
-      size <= HTTP2.get_server_setting(conn, :initial_window_size)
-  end
-
-  defp put_request(client, ref, body, left) do
-    request = %{body: body, left: left, status: nil, headers: [], data: []}
-    %{client | requests: Map.put(client.requests, ref, request)}
+    if not client.run?, do: send(self(), {__MODULE__, client.id, :run})
+    {:ok, %{client | run?: true}, ref}
   end
 
   @impl Mint.OTLP
+  def stream(%__MODULE__{id: id} = client, {:timeout, timer, {__MODULE__, id, :wake}}) do
+    # Cancelled timers may have been sent already
+    {client, acc} =
+      if timer == client.timer,
+        do: expire(%{client | timer: nil}, []),
+        else: {client, []}
+
+    {client, acc} = step(client, acc, nil)
+    {:responses, client, Enum.reverse(acc)}
+  end
+
+  # Running when there is nothing to do is harmless, so a message
+  # sent before close/1 needs no special handling.
+  def stream(%__MODULE__{id: id} = client, {__MODULE__, id, :run}) do
+    {client, acc} = step(%{client | run?: false}, [], nil)
+    {:responses, client, Enum.reverse(acc)}
+  end
+
+  def stream(%__MODULE__{conn: nil}, _message), do: :unknown
+
   def stream(%__MODULE__{} = client, message) do
     case HTTP2.stream(client.conn, message) do
-      {:ok, conn, responses} ->
-        {client, responses} = handle_responses(%{client | conn: conn}, responses)
-        {client, sent} = send_pending(client)
-        {:ok, client, responses ++ sent}
-
-      {:error, conn, error, responses} ->
-        {client, responses} = handle_responses(%{client | conn: conn}, responses)
-
-        if HTTP2.open?(conn, :write) do
-          {client, sent} = send_pending(client)
-          {:error, client, error, responses ++ sent}
-        else
-          # Exports that did not get a response will not get one anymore
-          failed = for {ref, _} <- client.requests, do: {:error, ref, error}
-          client = %{client | requests: %{}, sending: :queue.new()}
-          {:error, client, error, responses ++ failed}
-        end
-
-      :unknown ->
-        :unknown
+      {:ok, conn, responses} -> handle_responses(client, conn, responses, nil)
+      {:error, conn, error, responses} -> handle_responses(client, conn, responses, error)
+      :unknown -> :unknown
     end
+  end
+
+  defp handle_responses(client, conn, responses, error) do
+    client = %{client | conn: conn, received_at: now()}
+    {client, acc} = Enum.reduce(responses, {client, []}, &handle_response/2)
+    {client, acc} = step(client, acc, error)
+    {:responses, client, Enum.reverse(acc)}
   end
 
   @impl Mint.OTLP
   def close(%__MODULE__{} = client) do
-    {:ok, conn} = HTTP2.close(client.conn)
-    {:ok, %{client | conn: conn}}
+    cancel_timer(client.timer)
+    if client.conn, do: close_connection(client)
+
+    error = %Mint.TransportError{reason: :closed}
+
+    {client, acc} =
+      finish_all(client, Map.keys(client.exports), [], &finish(&1, &2, {:error, &2, error}, &3))
+
+    client = %{
+      client
+      | conn: nil,
+        run?: false,
+        failures: 0,
+        backoff_until: nil,
+        last_error: nil,
+        timer: nil
+    }
+
+    {:responses, client, Enum.reverse(acc)}
   end
 
-  @impl Mint.OTLP
-  def open?(%__MODULE__{} = client), do: HTTP2.open?(client.conn)
+  ## Steps
 
-  @impl Mint.OTLP
-  def open_request_count(%__MODULE__{} = client), do: map_size(client.requests)
+  # Runs after every event. Sending only happens while the connection
+  # is writable and the connection is only dropped at the end, or when
+  # found dead before the step, so the steps never act on a dropped
+  # connection. Responses are accumulated in reverse order.
+  defp step(client, acc, error) do
+    client = connect(client)
 
-  @doc """
-  Returns whether an export that failed with `error` may be retried.
+    # On errors, the connection is dropped below
+    {client, acc} =
+      if error do
+        {client, acc}
+      else
+        {client, acc} = send_bodies(client, acc)
+        start_queued(client, acc)
+      end
 
-  As defined by the OTLP specification for OTLP/gRPC, an error is
-  retryable if its code is `:cancelled`, `:deadline_exceeded`, `:aborted`,
-  `:out_of_range`, `:unavailable`, or `:data_loss`, or if its code is
-  `:resource_exhausted` and the server gave a retry delay.
-
-  Use `Mint.OTLP.retryable?/1`, which also handles connection errors.
-  """
-  @impl Mint.OTLP
-  def retryable?(%Error{transport: __MODULE__, code: code, retry_after: retry_after}) do
-    code in [:cancelled, :deadline_exceeded, :aborted, :out_of_range, :unavailable, :data_loss] or
-      (code == :resource_exhausted and retry_after != nil)
+    {client, acc} = check_connection(client, acc, error)
+    {schedule(client), acc}
   end
 
-  @impl Mint.OTLP
-  def controlling_process(%__MODULE__{} = client, pid) do
-    with {:ok, conn} <- HTTP2.controlling_process(client.conn, pid) do
-      {:ok, %{client | conn: conn}}
+  # Exports wait in the queue while it fails, until they expire.
+  defp connect(client) do
+    if client.conn == nil and client.backoff_until == nil and
+         not :queue.is_empty(client.queue) do
+      case HTTP2.connect(client.scheme, client.address, client.port, client.connect_opts) do
+        {:ok, conn} ->
+          %{client | conn: conn, received_at: now()}
+
+        {:error, error} ->
+          back_off(client, error)
+      end
+    else
+      client
     end
   end
+
+  defp check_connection(%{conn: nil} = client, acc, _error), do: {client, acc}
+
+  # Mint may stop reading from the socket after an error, so we drop
+  # the connection, even if it is still open.
+  defp check_connection(client, acc, error) when error != nil do
+    drop_connection(client, error, acc)
+  end
+
+  defp check_connection(client, acc, nil) do
+    error = %Mint.TransportError{reason: :closed}
+
+    cond do
+      HTTP2.open?(client.conn, :write) ->
+        {client, acc}
+
+      # After a GOAWAY, wait for the responses the server may still send,
+      # but requests still sending their body cannot finish.
+      HTTP2.open?(client.conn, :read) ->
+        {client, acc} =
+          Enum.reduce(client.streams, {client, acc}, fn {_stream, ref}, {client, acc} ->
+            case client.exports[ref].state do
+              {:in_flight, %{left: left}} when left > 0 -> retry(client, ref, error, acc)
+              {:in_flight, _request} -> {client, acc}
+            end
+          end)
+
+        if client.streams == %{}, do: drop_connection(client, error, acc), else: {client, acc}
+
+      true ->
+        drop_connection(client, error, acc)
+    end
+  end
+
+  # The only place connections are dropped. Exports in flight are sent
+  # again on a new connection, regardless of the error that dropped it,
+  # such as a protocol error, as they got no response.
+  defp drop_connection(client, error, acc) do
+    close_connection(client)
+    client = %{client | conn: nil}
+
+    if client.streams != %{} do
+      exports = map_size(client.streams)
+
+      Logger.info(
+        "OTLP connection closed with #{exports} exports in flight: " <> Exception.message(error)
+      )
+    end
+
+    {client, acc} =
+      Enum.reduce(client.streams, {client, acc}, fn {_stream, ref}, {client, acc} ->
+        retry(client, ref, error, acc)
+      end)
+
+    # Servers routinely close connections, so the first time we
+    # reconnect right away, when the timer fires, unless backing off
+    if client.failures == 0 do
+      now = now()
+      backoff_until = max(client.backoff_until || now, now)
+      {%{client | failures: 1, backoff_until: backoff_until, last_error: error}, acc}
+    else
+      {back_off(client, error), acc}
+    end
+  end
+
+  # Closing the socket is synchronous and messages from the socket
+  # arrive in order, so once it is closed, all of its messages are
+  # already in the mailbox and we remove them, so they are not given
+  # to stream/2 as unknown messages.
+  defp close_connection(client) do
+    socket = HTTP2.get_socket(client.conn)
+    {:ok, _conn} = HTTP2.close(client.conn)
+
+    # Mint does not close the socket if it already considers it closed
+    if client.scheme == :https, do: :ssl.close(socket), else: :gen_tcp.close(socket)
+    flush_socket(socket)
+  end
+
+  defp flush_socket(socket) do
+    receive do
+      {tag, ^socket, _} when tag in [:tcp, :ssl, :tcp_error, :ssl_error] -> flush_socket(socket)
+      {tag, ^socket} when tag in [:tcp_closed, :ssl_closed] -> flush_socket(socket)
+    after
+      0 -> :ok
+    end
+  end
+
+  ## Timers
+
+  # Arms the timer for the earliest time the client has something to
+  # do, if it changed. `nil` sorts after integers, so it means never.
+  defp schedule(client) do
+    at =
+      Enum.reduce(client.exports, client.backoff_until, fn
+        {_ref, %{state: :queued, expires_at: expires_at}}, at ->
+          min(expires_at, at)
+
+        {_ref, %{state: {:in_flight, request}}}, at ->
+          min(request.started_at + client.timeout, at)
+      end)
+
+    # A cancelled timer may have been sent already, which stream/2
+    # ignores, as it is no longer the current one. The timer is sent to
+    # the calling process, which must be the one that owns the socket.
+    cancel_timer(client.timer)
+    timer = at && :erlang.start_timer(max(at - now(), 0), self(), {__MODULE__, client.id, :wake})
+    %{client | timer: timer}
+  end
+
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(timer), do: :erlang.cancel_timer(timer, async: true, info: false)
+
+  # Handles everything that is due.
+  defp expire(client, acc) do
+    now = now()
+    client = if client.backoff_until <= now, do: %{client | backoff_until: nil}, else: client
+
+    late =
+      for {stream, ref} <- client.streams,
+          {:in_flight, request} = client.exports[ref].state,
+          now - request.started_at >= client.timeout,
+          do: {stream, ref}
+
+    {client, acc} =
+      cond do
+        late == [] ->
+          {client, acc}
+
+        # The server sent nothing while we waited, so the connection is
+        # dead, or the server is too slow, so we also back off
+        now - client.received_at >= client.timeout ->
+          error = %Mint.TransportError{reason: :timeout}
+          {client, acc} = drop_connection(client, error, acc)
+          {back_off(client, error), acc}
+
+        true ->
+          error = error(:deadline_exceeded, "no response after #{client.timeout}ms")
+
+          Enum.reduce(late, {client, acc}, fn {stream, ref}, {client, acc} ->
+            client |> cancel_stream(stream) |> failed(ref, error, acc)
+          end)
+      end
+
+    expired =
+      for ref <- :queue.to_list(client.queue), client.exports[ref].expires_at <= now, do: ref
+
+    # The last failure since the last success is likely why they could not be sent
+    error = client.last_error || error(:deadline_exceeded, "could not be sent in time")
+    finish_all(client, expired, acc, &discard(&1, &2, error, &3))
+  end
+
+  ## Export states
+
+  # Moves an export to a new state, keeping `streams` and `queue` in sync.
+  defp set_state(client, ref, state) do
+    client = leave_state(client, ref)
+
+    client =
+      case state do
+        :queued -> %{client | queue: :queue.in(ref, client.queue)}
+        {:in_flight, request} -> %{client | streams: Map.put(client.streams, request.stream, ref)}
+      end
+
+    update_in(client.exports[ref], &%{&1 | state: state})
+  end
+
+  defp leave_state(client, ref) do
+    case client.exports[ref].state do
+      :queued -> %{client | queue: :queue.delete(ref, client.queue)}
+      {:in_flight, %{stream: stream}} -> %{client | streams: Map.delete(client.streams, stream)}
+    end
+  end
+
+  # The only place exports are removed and responses returned.
+  defp finish(client, ref, response, acc) do
+    client = leave_state(client, ref)
+    {%{client | exports: Map.delete(client.exports, ref)}, [response | acc]}
+  end
+
+  # Takes the exports out of the queue at once, instead of searching it for each.
+  defp finish_all(client, refs, acc, fun) do
+    set = MapSet.new(refs)
+    queue = :queue.filter(&(not MapSet.member?(set, &1)), client.queue)
+
+    {client, acc} =
+      Enum.reduce(refs, {%{client | queue: :queue.new()}, acc}, fn ref, {client, acc} ->
+        fun.(client, ref, acc)
+      end)
+
+    {%{client | queue: queue}, acc}
+  end
+
+  # The client gave up on an export.
+  defp discard(client, ref, error, acc) do
+    Logger.error("Discarding OTLP export: " <> Exception.message(error))
+    finish(client, ref, {:error, ref, error}, acc)
+  end
+
+  ## Retries
+
+  # An attempt failed. Requests left unprocessed by a GOAWAY, or that
+  # failed because of the connection, are retried right away, as the
+  # connection is dropped and reconnects with its own backoff. Retryable
+  # server responses are retried after the whole client backs off.
+  defp failed(client, ref, error, acc) do
+    case classify(error) do
+      :requeue ->
+        retry(client, ref, error, acc)
+
+      :back_off ->
+        {client, acc} = retry(client, ref, error, acc)
+        {back_off(client, error), acc}
+
+      :fail ->
+        discard(client, ref, error, acc)
+    end
+  end
+
+  # Puts the export back in the queue, unless it cannot be retried.
+  defp retry(client, ref, error, acc) do
+    if client.max_elapsed_time != nil and now() < client.exports[ref].expires_at do
+      {set_state(client, ref, :queued), acc}
+    else
+      discard(client, ref, error, acc)
+    end
+  end
+
+  # Exponential backoff with a multiplier of 1.5 and +-50% jitter,
+  # respecting the delay given by the server. While already backing
+  # off, failures only extend it to the server delay.
+  defp back_off(client, error) do
+    now = now()
+    retry_after = retry_after(error)
+
+    if client.backoff_until != nil and client.backoff_until > now do
+      %{client | backoff_until: max(client.backoff_until, now + retry_after), last_error: error}
+    else
+      %{initial_backoff: initial, max_backoff: max} = client.backoff
+      delay = min(max, initial * :math.pow(1.5, min(client.failures, 32)))
+      delay = max(min(max, round(delay * (0.5 + :rand.uniform()))), retry_after)
+      Logger.info("Backing off OTLP exports for #{delay}ms after: " <> Exception.message(error))
+
+      %{
+        client
+        | failures: client.failures + 1,
+          backoff_until: now + delay,
+          last_error: error
+      }
+    end
+  end
+
+  defp classify(%Error{code: code, retry_after: retry_after}) do
+    if code in @retryable_codes or (code == :resource_exhausted and retry_after != nil),
+      do: :back_off,
+      else: :fail
+  end
+
+  # The server did not process requests refused with REFUSED_STREAM or
+  # beyond its limit, but they would be sent again on the same connection,
+  # so we back off. CANCEL maps to CANCELLED in gRPC.
+  defp classify(%Mint.HTTPError{reason: {:server_closed_request, :refused_stream}}), do: :back_off
+  defp classify(%Mint.HTTPError{reason: {:server_closed_request, :cancel}}), do: :back_off
+  defp classify(%Mint.HTTPError{reason: :too_many_concurrent_requests}), do: :back_off
+  defp classify(error), do: if(connection_error?(error), do: :requeue, else: :fail)
+
+  defp connection_error?(%Mint.TransportError{}), do: true
+
+  defp connection_error?(%Mint.HTTPError{reason: reason}) do
+    case reason do
+      :closed -> true
+      :closed_for_writing -> true
+      :unprocessed -> true
+      {:server_closed_connection, _, _} -> true
+      _ -> false
+    end
+  end
+
+  defp connection_error?(_error), do: false
+
+  defp retry_after(%Error{retry_after: retry_after}) when retry_after != nil, do: retry_after
+  defp retry_after(_error), do: 0
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   ## Sending
 
-  defp send_pending(client) do
-    {client, blocked, responses} =
-      client.sending
-      |> :queue.to_list()
-      |> Enum.reduce({client, [], []}, fn ref, {client, blocked, responses} ->
-        case send_body(client, ref) do
-          {:sent, client, new} -> {client, blocked, new ++ responses}
-          {:blocked, client} -> {client, [ref | blocked], responses}
-        end
-      end)
-
-    {%{client | sending: :queue.from_list(Enum.reverse(blocked))}, Enum.reverse(responses)}
-  end
-
-  defp send_body(client, ref) do
-    case client.requests do
-      %{^ref => %{body: body, left: left}} ->
-        conn = client.conn
-
-        window =
-          min(
-            HTTP2.get_window_size(conn, :connection),
-            HTTP2.get_window_size(conn, {:request, ref})
-          )
-
-        send_data(client, ref, body, left, window)
-
-      %{} ->
-        # The server already answered or the request failed
-        {:sent, client, []}
+  # Starts queued exports while not backing off and the connection is
+  # writable and has room for more streams.
+  defp start_queued(client, acc) do
+    with nil <- client.backoff_until,
+         %{} = conn <- client.conn,
+         true <- HTTP2.open?(conn, :write),
+         true <- HTTP2.open_request_count(conn) < server_setting(conn, :max_concurrent_streams),
+         {:value, ref} <- :queue.peek(client.queue) do
+      {client, acc} = start_request(client, ref, acc)
+      start_queued(client, acc)
+    else
+      _ -> {client, acc}
     end
   end
 
-  defp send_data(client, ref, [], 0, _window) do
-    case HTTP2.stream_request_body(client.conn, ref, :eof) do
-      {:ok, conn} -> {:sent, put_body(%{client | conn: conn}, ref, [], 0), []}
-      {:error, conn, error} -> {:sent, drop(%{client | conn: conn}, ref), [{:error, ref, error}]}
-    end
-  end
+  defp start_request(client, ref, acc) do
+    %{path: path, headers: headers, body: body, frame_size: frame_size} = client.exports[ref]
+    conn = client.conn
 
-  defp send_data(client, ref, body, left, 0) do
-    {:blocked, put_body(client, ref, body, left)}
-  end
+    # The request fits the windows, so it is sent at once
+    fits? =
+      frame_size <= @max_write and
+        frame_size <= HTTP2.get_window_size(conn, :connection) and
+        frame_size <= server_setting(conn, :initial_window_size)
 
-  # Sends as much as the window allows in one go, either finishing
-  # the body or exhausting the window.
-  defp send_data(client, ref, body, left, window) do
-    size = min(left, window)
-    {data, rest} = split(body, size, [])
+    case HTTP2.request(conn, "POST", path, headers, if(fits?, do: body, else: :stream)) do
+      {:ok, conn, stream} ->
+        request = %{
+          stream: stream,
+          started_at: now(),
+          rest: if(fits?, do: [], else: body),
+          left: if(fits?, do: 0, else: frame_size),
+          status: nil,
+          response_headers: [],
+          data: []
+        }
 
-    case HTTP2.stream_request_body(client.conn, ref, data) do
-      {:ok, conn} ->
-        send_data(%{client | conn: conn}, ref, rest, left - size, window - size)
+        client = set_state(%{client | conn: conn}, ref, {:in_flight, request})
+        if fits?, do: {client, acc}, else: send_body(client, ref, acc)
 
       {:error, conn, error} ->
-        {:sent, drop(%{client | conn: conn}, ref), [{:error, ref, error}]}
+        send_failed(%{client | conn: conn}, ref, error, acc)
     end
   end
 
-  defp put_body(client, ref, body, left) do
-    update_in(client.requests[ref], &%{&1 | body: body, left: left})
+  defp send_failed(client, ref, error, acc) do
+    {client, acc} = failed(client, ref, error, acc)
+    {close_on_connection_error(client, error), acc}
   end
 
-  defp drop(client, ref), do: %{client | requests: Map.delete(client.requests, ref)}
+  defp cancel_stream(client, stream) do
+    case HTTP2.cancel_request(client.conn, stream) do
+      {:ok, conn} -> %{client | conn: conn}
+      {:error, conn, error} -> close_on_connection_error(%{client | conn: conn}, error)
+    end
+  end
+
+  # Mint keeps the connection open when writing to the socket fails,
+  # so we close it, and it is dropped at the end of the step.
+  defp close_on_connection_error(client, error) do
+    if connection_error?(error) do
+      {:ok, conn} = HTTP2.close(client.conn)
+      %{client | conn: conn}
+    else
+      client
+    end
+  end
+
+  defp send_bodies(client, acc) do
+    Enum.reduce(client.streams, {client, acc}, fn {_stream, ref}, {client, acc} ->
+      send_body(client, ref, acc)
+    end)
+  end
+
+  # Sends as much of the body as the windows allow, in writes of at most
+  # @max_write, finishing the body or exhausting the windows. Windows may
+  # be negative when the server lowers its initial window.
+  defp send_body(client, ref, acc) do
+    with %{^ref => %{state: {:in_flight, %{left: left} = request}}} when left > 0 <-
+           client.exports,
+         true <- HTTP2.open?(client.conn, :write),
+         %{stream: stream, rest: rest} = request,
+         window = HTTP2.request_body_window(client.conn, stream),
+         size when size > 0 <- left |> min(window) |> min(@max_write) |> max(0) do
+      {data, rest} = split(rest, size, [])
+
+      with {:ok, conn} <- HTTP2.stream_request_body(client.conn, stream, data),
+           {:ok, conn} <- maybe_eof(conn, stream, left - size) do
+        request = %{request | rest: rest, left: left - size}
+        client = %{client | conn: conn}
+        client = update_in(client.exports[ref], &%{&1 | state: {:in_flight, request}})
+        send_body(client, ref, acc)
+      else
+        {:error, conn, error} ->
+          client = cancel_stream(%{client | conn: conn}, stream)
+          send_failed(client, ref, error, acc)
+      end
+    else
+      _ -> {client, acc}
+    end
+  end
+
+  defp maybe_eof(conn, stream, 0), do: HTTP2.stream_request_body(conn, stream, :eof)
+  defp maybe_eof(conn, _stream, _left), do: {:ok, conn}
+
+  defp server_setting(conn, name), do: HTTP2.get_server_setting(conn, name)
 
   # Splits iodata after `size` bytes. While the head of the list is a
   # binary, we split it into sub-binaries to avoid copying the payload.
@@ -309,73 +775,84 @@ defmodule Mint.OTLP.GRPC do
 
   ## Responses
 
-  defp handle_responses(client, responses) do
-    {client, acc} = Enum.reduce(responses, {client, []}, &handle_response/2)
-    {client, Enum.reverse(acc)}
-  end
+  # Streams no longer in `streams` were abandoned, so we ignore them.
+  defp handle_response({:done, stream}, {client, acc}) do
+    case client.streams do
+      %{^stream => ref} ->
+        {:in_flight, request} = client.exports[ref].state
 
-  defp handle_response({:status, ref, status}, {client, acc}) do
-    {update_request(client, ref, &%{&1 | status: status}), acc}
-  end
+        case result(request) do
+          {:ok, info} ->
+            client = %{client | failures: 0, last_error: nil}
+            finish(client, ref, {:done, ref, info}, acc)
 
-  # Both the headers and the trailers
-  defp handle_response({:headers, ref, headers}, {client, acc}) do
-    {update_request(client, ref, &%{&1 | headers: &1.headers ++ headers}), acc}
-  end
+          {:error, error} ->
+            failed(client, ref, error, acc)
+        end
 
-  defp handle_response({:data, ref, data}, {client, acc}) do
-    {update_request(client, ref, &%{&1 | data: [&1.data | data]}), acc}
-  end
-
-  defp handle_response({:done, ref}, {client, acc}) do
-    case Map.pop(client.requests, ref) do
-      {nil, _} -> {client, acc}
-      {request, requests} -> {%{client | requests: requests}, [result(ref, request) | acc]}
+      %{} ->
+        {client, acc}
     end
   end
 
-  defp handle_response({:error, ref, error}, {client, acc}) do
-    case Map.pop(client.requests, ref) do
-      {nil, _} -> {client, acc}
-      {_, requests} -> {%{client | requests: requests}, [{:error, ref, error} | acc]}
+  defp handle_response({:error, stream, error}, {client, acc}) do
+    case client.streams do
+      %{^stream => ref} -> failed(client, ref, error, acc)
+      %{} -> {client, acc}
+    end
+  end
+
+  defp handle_response({tag, stream, value}, {client, acc})
+       when tag in [:status, :headers, :data] do
+    case client.streams do
+      %{^stream => ref} ->
+        {:in_flight, request} = client.exports[ref].state
+        request = put_response(request, tag, value)
+        {update_in(client.exports[ref], &%{&1 | state: {:in_flight, request}}), acc}
+
+      %{} ->
+        {client, acc}
     end
   end
 
   defp handle_response(_other, {client, acc}), do: {client, acc}
 
-  defp update_request(client, ref, fun) do
-    case client.requests do
-      %{^ref => request} -> %{client | requests: %{client.requests | ref => fun.(request)}}
-      %{} -> client
-    end
-  end
+  defp put_response(request, :status, status), do: %{request | status: status}
+  defp put_response(request, :data, data), do: %{request | data: [request.data | data]}
 
-  defp result(ref, %{status: 200} = request) do
-    case List.keyfind(request.headers, "grpc-status", 0) do
-      {_, "0"} ->
+  # Both the headers and the trailers
+  defp put_response(request, :headers, headers),
+    do: %{request | response_headers: request.response_headers ++ headers}
+
+  defp result(request) do
+    case List.keyfind(request.response_headers, "grpc-status", 0) do
+      {_, "0"} when request.status == 200 ->
         case decode_response(IO.iodata_to_binary(request.data)) do
-          {:ok, partial_success} -> {:ok, ref, partial_success}
-          :error -> {:error, ref, error(:internal, "malformed response message")}
+          {:ok, partial_success} -> {:ok, partial_success}
+          :error -> {:error, error(:internal, "malformed response message")}
         end
 
-      {_, status} ->
+      {_, status} when status != "0" ->
         code =
           case Integer.parse(status) do
             {status, ""} -> Map.get(@codes, status, :unknown)
             _ -> :unknown
           end
 
-        message = grpc_message(request.headers)
-        {:error, ref, error(code, message, retry_after(request.headers))}
+        message = grpc_message(request.response_headers)
+        {:error, error(code, message, retry_after_header(request.response_headers))}
 
       # As gRPC clients do, protocol errors are internal errors
-      nil ->
-        {:error, ref, error(:internal, "missing grpc-status header")}
+      nil when request.status == 200 ->
+        {:error, error(:internal, "missing grpc-status header")}
+
+      _ ->
+        http_result(request.status)
     end
   end
 
   # As described in "HTTP to gRPC Status Code Mapping" from the gRPC docs
-  defp result(ref, %{status: status}) do
+  defp http_result(status) do
     code =
       case status do
         400 -> :internal
@@ -386,7 +863,7 @@ defmodule Mint.OTLP.GRPC do
         _ -> :unknown
       end
 
-    {:error, ref, error(code, "HTTP status #{status}")}
+    {:error, error(code, "HTTP status #{status}")}
   end
 
   defp error(code, message, retry_after \\ nil) do
@@ -395,8 +872,11 @@ defmodule Mint.OTLP.GRPC do
 
   defp grpc_message(headers) do
     case List.keyfind(headers, "grpc-message", 0) do
-      {_, message} -> URI.decode(message)
-      nil -> ""
+      {_, message} ->
+        URI.decode(message)
+
+      nil ->
+        ""
     end
   end
 
@@ -408,10 +888,10 @@ defmodule Mint.OTLP.GRPC do
   defp decode_response(<<0, size::32, message::binary-size(size)>>) do
     with {:ok, fields} <- Protobuf.decode(message) do
       case List.keyfind(fields, 1, 0) do
-        {1, partial_success} when is_binary(partial_success) ->
+        {1, partial_success} ->
           with {:ok, fields} <- Protobuf.decode(partial_success) do
-            rejected = for({1, value} <- fields, do: value) |> List.last(0)
-            error_message = for({2, value} <- fields, do: value) |> List.last("")
+            {1, rejected} = List.keyfind(fields, 1, 0, {1, 0})
+            {2, error_message} = List.keyfind(fields, 2, 0, {2, ""})
             {:ok, %{rejected: rejected, error_message: error_message}}
           end
 
@@ -425,12 +905,12 @@ defmodule Mint.OTLP.GRPC do
 
   # The retry delay comes as a google.rpc.RetryInfo in the details
   # (field 3) of the google.rpc.Status in grpc-status-details-bin.
-  defp retry_after(headers) do
+  defp retry_after_header(headers) do
     with {_, details} <- List.keyfind(headers, "grpc-status-details-bin", 0),
          {:ok, status} <- Base.decode64(details, padding: false),
          {:ok, fields} <- Protobuf.decode(status) do
       Enum.find_value(fields, fn
-        {3, any} when is_binary(any) -> retry_info(any)
+        {3, any} -> retry_info(any)
         _ -> nil
       end)
     else
@@ -445,8 +925,8 @@ defmodule Mint.OTLP.GRPC do
          {:ok, fields} <- Protobuf.decode(retry_info),
          {1, duration} <- List.keyfind(fields, 1, 0),
          {:ok, fields} <- Protobuf.decode(duration) do
-      seconds = for({1, value} <- fields, do: value) |> List.last(0)
-      nanos = for({2, value} <- fields, do: value) |> List.last(0)
+      {1, seconds} = List.keyfind(fields, 1, 0, {1, 0})
+      {2, nanos} = List.keyfind(fields, 2, 0, {2, 0})
       seconds * 1000 + div(nanos, 1_000_000)
     else
       _ -> nil

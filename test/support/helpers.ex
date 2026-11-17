@@ -19,8 +19,7 @@ defmodule Mint.OTLP.TestHelpers do
       message when not (is_tuple(message) and elem(message, 0) == :test_server) ->
         {client, responses} =
           case Mint.OTLP.stream(client, message) do
-            {:ok, client, responses} -> {client, responses}
-            {:error, client, _error, responses} -> {client, responses}
+            {:responses, client, responses} -> {client, responses}
             :unknown -> flunk("unknown message: #{inspect(message)}")
           end
 

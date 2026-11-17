@@ -1,6 +1,7 @@
 defmodule Mint.OTLP.Error do
   @moduledoc """
-  An export that failed.
+  An export that failed, as returned by the server, or as determined by
+  the client, such as when the server does not respond in time.
 
   The public fields are:
 
@@ -16,7 +17,7 @@ defmodule Mint.OTLP.Error do
       wait before retrying, or `nil`
 
   Errors from the underlying connection are returned as `Mint.HTTPError`
-  and `Mint.TransportError`. See `Mint.OTLP.retryable?/1`.
+  and `Mint.TransportError`.
   """
 
   @type t() :: %__MODULE__{

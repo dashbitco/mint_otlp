@@ -14,6 +14,9 @@ defmodule Mint.OTLP.TestServer do
     * `sleep:MILLISECONDS:RESPONSE` - waits before reading the body,
       so flow control windows are not refilled meanwhile
 
+  When `headers/2` is given a number of times, the response is only
+  used that many times for the export, and `ok` afterwards.
+
   Plug does not support trailers, so the gRPC status is always sent in
   the headers, as in gRPC "Trailers-Only" responses.
   """
@@ -21,18 +24,33 @@ defmodule Mint.OTLP.TestServer do
 
   import Bitwise
 
-  def start do
-    {:ok, pid} = Bandit.start_link(plug: __MODULE__, port: 0, ip: :loopback, startup_log: false)
+  @doc """
+  Starts a server and returns its pid and port.
+
+  `opts` are given to `Bandit.start_link/1`.
+  """
+  def start(port \\ 0, opts \\ []) do
+    # Counts requests per export, owned by the first caller, test_helper.exs
+    if :ets.whereis(__MODULE__) == :undefined do
+      :ets.new(__MODULE__, [:named_table, :public, :set])
+    end
+
+    {:ok, pid} =
+      Bandit.start_link([plug: __MODULE__, port: port, ip: :loopback, startup_log: false] ++ opts)
+
+    Process.unlink(pid)
     {:ok, {_ip, port}} = ThousandIsland.listener_info(pid)
-    port
+    {pid, port}
   end
 
   @doc """
-  Headers that make the server send requests to the calling process.
+  Headers that make the server send requests to the calling process
+  and respond with `response`, at most `times` for this export.
   """
-  def headers(response \\ "ok") do
+  def headers(response \\ "ok", times \\ :infinity) do
     pid = self() |> :erlang.term_to_binary() |> Base.encode64()
-    [{"x-test-pid", pid}, {"x-test", response}]
+    id = make_ref() |> :erlang.term_to_binary() |> Base.encode64()
+    [{"x-test-pid", pid}, {"x-test", response}, {"x-test-id", id}, {"x-test-times", "#{times}"}]
   end
 
   @impl true
@@ -40,7 +58,11 @@ defmodule Mint.OTLP.TestServer do
 
   @impl true
   def call(conn, _opts) do
-    [response] = Plug.Conn.get_req_header(conn, "x-test")
+    response =
+      case Plug.Conn.get_req_header(conn, "x-test") do
+        [response] -> limit(conn, response)
+        [] -> "ok"
+      end
 
     response =
       case String.split(response, ":", parts: 3) do
@@ -60,6 +82,19 @@ defmodule Mint.OTLP.TestServer do
     end
 
     respond(conn, String.split(response, ":", parts: 3))
+  end
+
+  defp limit(conn, response) do
+    [id] = Plug.Conn.get_req_header(conn, "x-test-id")
+
+    case Plug.Conn.get_req_header(conn, "x-test-times") do
+      ["infinity"] ->
+        response
+
+      [times] ->
+        count = :ets.update_counter(__MODULE__, id, 1, {id, 0})
+        if count > String.to_integer(times), do: "ok", else: response
+    end
   end
 
   defp read_body(conn, acc) do

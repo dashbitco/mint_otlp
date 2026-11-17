@@ -11,3 +11,4 @@ services:
       - ./test/support/collector.yaml:/etc/otelcol/config.yaml:ro
     ports:
       - "4317:4317"
+      - "4319:4319"
