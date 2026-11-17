@@ -44,7 +44,9 @@ defmodule Mint.OTLP.MixProject do
 
   defp deps do
     [
-      {:mint, "~> 1.7"},
+      # Splits request bodies into frames without converting them to binaries,
+      # see https://github.com/elixir-mint/mint/pull/549
+      {:mint, github: "josevalim/mint", branch: "jv-avoid-iodata"},
 
       # Test dependencies
       {:bandit, "~> 1.6", only: :test},

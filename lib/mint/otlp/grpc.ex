@@ -9,11 +9,11 @@ defmodule Mint.OTLP.GRPC do
   ## Flow control
 
   `Mint.HTTP2` keeps track of the HTTP/2 flow control windows but never
-  waits on them. This module sends request bodies in chunks of at most
-  the server's `SETTINGS_MAX_FRAME_SIZE`, as long as both the connection
-  and the request windows allow, and keeps the rest of the body until
-  `Mint.OTLP.stream/2` processes WINDOW_UPDATE frames from the server.
-  Requests are sent in the order they were exported.
+  waits on them. This module sends as much of a request body as both the
+  connection and the request windows allow, which `Mint.HTTP2` splits
+  into frames, and keeps the rest of the body until `Mint.OTLP.stream/2`
+  processes WINDOW_UPDATE frames from the server. Requests are sent in
+  the order they were exported.
   """
 
   @behaviour Mint.OTLP
@@ -121,7 +121,7 @@ defmodule Mint.OTLP.GRPC do
     body = [<<0, size::32>> | request]
     size = size + 5
 
-    if fits_one_frame?(client.conn, size) do
+    if fits_window?(client.conn, size) do
       case HTTP2.request(client.conn, "POST", @paths[signal], headers, body) do
         {:ok, conn, ref} -> {:ok, put_request(%{client | conn: conn}, ref, [], 0), ref}
         {:error, conn, error} -> {:error, %{client | conn: conn}, error}
@@ -151,10 +151,9 @@ defmodule Mint.OTLP.GRPC do
   defp timeout_header(nil), do: []
   defp timeout_header(timeout) when is_integer(timeout), do: [{"grpc-timeout", "#{timeout}m"}]
 
-  defp fits_one_frame?(conn, size) do
+  defp fits_window?(conn, size) do
     size <= HTTP2.get_window_size(conn, :connection) and
-      size <= HTTP2.get_server_setting(conn, :initial_window_size) and
-      size <= HTTP2.get_server_setting(conn, :max_frame_size)
+      size <= HTTP2.get_server_setting(conn, :initial_window_size)
   end
 
   defp put_request(client, ref, body, left) do
@@ -250,14 +249,7 @@ defmodule Mint.OTLP.GRPC do
             HTTP2.get_window_size(conn, {:request, ref})
           )
 
-        send_chunks(
-          client,
-          ref,
-          body,
-          left,
-          window,
-          HTTP2.get_server_setting(conn, :max_frame_size)
-        )
+        send_data(client, ref, body, left, window)
 
       %{} ->
         # The server already answered or the request failed
@@ -265,24 +257,26 @@ defmodule Mint.OTLP.GRPC do
     end
   end
 
-  defp send_chunks(client, ref, [], 0, _window, _max_frame) do
+  defp send_data(client, ref, [], 0, _window) do
     case HTTP2.stream_request_body(client.conn, ref, :eof) do
       {:ok, conn} -> {:sent, put_body(%{client | conn: conn}, ref, [], 0), []}
       {:error, conn, error} -> {:sent, drop(%{client | conn: conn}, ref), [{:error, ref, error}]}
     end
   end
 
-  defp send_chunks(client, ref, body, left, 0, _max_frame) do
+  defp send_data(client, ref, body, left, 0) do
     {:blocked, put_body(client, ref, body, left)}
   end
 
-  defp send_chunks(client, ref, body, left, window, max_frame) do
-    size = left |> min(window) |> min(max_frame)
-    {chunk, rest} = split(body, size, [])
+  # Sends as much as the window allows in one go, either finishing
+  # the body or exhausting the window.
+  defp send_data(client, ref, body, left, window) do
+    size = min(left, window)
+    {data, rest} = split(body, size, [])
 
-    case HTTP2.stream_request_body(client.conn, ref, chunk) do
+    case HTTP2.stream_request_body(client.conn, ref, data) do
       {:ok, conn} ->
-        send_chunks(%{client | conn: conn}, ref, rest, left - size, window - size, max_frame)
+        send_data(%{client | conn: conn}, ref, rest, left - size, window - size)
 
       {:error, conn, error} ->
         {:sent, drop(%{client | conn: conn}, ref), [{:error, ref, error}]}
