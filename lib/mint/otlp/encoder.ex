@@ -1,11 +1,11 @@
 defmodule Mint.OTLP.Encoder do
   @moduledoc """
-  Encodes OTLP export requests as protobuf.
+  Encodes OTLP export requests for traces and logs as protobuf.
 
   Telemetry is encoded upfront, as it is produced, and requests are
   built from the encoded parts. Each function returns a binary already
   encoded as a field of the message that contains it, such as a span
-  within its `ScopeSpans`. As protobuf fields may be concatenated, the
+  within its `ScopeSpans` or a log record within its `ScopeLogs`. As protobuf fields may be concatenated, the
   parts can be stored, counted with `byte_size/1`, and put together
   into requests without being encoded again.
 
@@ -14,6 +14,10 @@ defmodule Mint.OTLP.Encoder do
       span = Mint.OTLP.Encoder.span(trace_id, span_id, "GET /users", started_at, ended_at)
 
       request = Mint.OTLP.Encoder.traces(resource, [{scope, [span]}])
+      {:ok, client, ref} = Mint.OTLP.export(client, request)
+
+      log_record = Mint.OTLP.Encoder.log_record(time, "hello", severity: :info)
+      request = Mint.OTLP.Encoder.logs(resource, [{scope, [log_record]}])
       {:ok, client, ref} = Mint.OTLP.export(client, request)
 
   The parts are not tagged with their type, so they must be given to the
@@ -41,6 +45,18 @@ defmodule Mint.OTLP.Encoder do
 
   @kinds %{internal: 1, server: 2, client: 3, producer: 4, consumer: 5}
 
+  # The syslog mapping from the OpenTelemetry logs data model
+  @severities %{
+    debug: 5,
+    info: 9,
+    notice: 10,
+    warning: 13,
+    error: 17,
+    critical: 18,
+    alert: 19,
+    emergency: 21
+  }
+
   @doc """
   Encodes an `ExportTraceServiceRequest` with the given resource, as
   returned by `resource/1`, and spans grouped by scope, as returned by
@@ -65,14 +81,47 @@ defmodule Mint.OTLP.Encoder do
   """
   @spec traces(binary(), [{binary(), [binary()]}]) :: Mint.OTLP.request()
   def traces(resource, scope_spans) when is_binary(resource) and is_list(scope_spans) do
-    {scope_spans, size} =
-      Enum.map_reduce(scope_spans, byte_size(resource), fn {scope, spans}, acc ->
-        size = Enum.reduce(spans, byte_size(scope), &(byte_size(&1) + &2))
+    {:traces, request(resource, scope_spans)}
+  end
+
+  @doc """
+  Encodes an `ExportLogsServiceRequest` with the given resource, as
+  returned by `resource/1`, and log records grouped by scope, as returned
+  by `scope/2` and `log_record/3`:
+
+      message ExportLogsServiceRequest {
+        repeated ResourceLogs resource_logs = 1;
+      }
+
+      message ResourceLogs {
+        Resource resource = 1;
+        repeated ScopeLogs scope_logs = 2;
+      }
+
+      message ScopeLogs {
+        InstrumentationScope scope = 1;
+        repeated LogRecord log_records = 2;
+      }
+
+  Returns `{:logs, iodata}`, to be given to `Mint.OTLP.export/3`.
+  The iodata references the given binaries without copying them.
+  """
+  @spec logs(binary(), [{binary(), [binary()]}]) :: Mint.OTLP.request()
+  def logs(resource, scope_logs) when is_binary(resource) and is_list(scope_logs) do
+    {:logs, request(resource, scope_logs)}
+  end
+
+  # Requests for all signals have the same shape, with a single resource
+  # as field 1, and items grouped by scope as field 2.
+  defp request(resource, scopes) do
+    {scopes, size} =
+      Enum.map_reduce(scopes, byte_size(resource), fn {scope, items}, acc ->
+        size = Enum.reduce(items, byte_size(scope), &(byte_size(&1) + &2))
         prefix = <<0x12, varint(size)::binary>>
-        {[prefix, scope | spans], acc + byte_size(prefix) + size}
+        {[prefix, scope | items], acc + byte_size(prefix) + size}
       end)
 
-    {:traces, [<<0x0A, varint(size)::binary>>, resource | scope_spans]}
+    [<<0x0A, varint(size)::binary>>, resource | scopes]
   end
 
   @doc """
@@ -193,6 +242,12 @@ defmodule Mint.OTLP.Encoder do
   defp flags(nil), do: []
   defp flags(flags), do: <<0x85, 0x01, flags::little-32>>
 
+  defp fixed32(_tag, nil), do: []
+  defp fixed32(tag, value), do: <<tag, value::little-32>>
+
+  defp fixed64(_tag, nil), do: []
+  defp fixed64(tag, value), do: <<tag, value::little-64>>
+
   @doc """
   Encodes an `Event` of a span:
 
@@ -230,19 +285,73 @@ defmodule Mint.OTLP.Encoder do
   """
   @spec link(binary(), binary(), keyword()) :: binary()
   def link(trace_id, span_id, opts \\ []) when is_binary(trace_id) and is_binary(span_id) do
-    flags =
-      case Keyword.get(opts, :flags) do
-        nil -> []
-        flags -> <<0x35, flags::little-32>>
-      end
-
     message(13, [
       string(1, trace_id),
       string(2, span_id),
       string(3, Keyword.get(opts, :trace_state, "")),
       attributes(4, Keyword.get(opts, :attributes, [])),
-      flags
+      fixed32(0x35, Keyword.get(opts, :flags))
     ])
+  end
+
+  @doc """
+  Encodes a `LogRecord`:
+
+      message LogRecord {
+        fixed64 time_unix_nano = 1;
+        fixed64 observed_time_unix_nano = 11;
+        SeverityNumber severity_number = 2;
+        string severity_text = 3;
+        AnyValue body = 5;
+        repeated KeyValue attributes = 6;
+        fixed32 flags = 8;
+        bytes trace_id = 9;
+        bytes span_id = 10;
+        string event_name = 12;
+      }
+
+  `body` is encoded as an attribute value, such as a string or a map,
+  and it is not encoded if `nil`.
+
+  ## Options
+
+    * `:observed_time` - when the log record was observed, if it differs
+      from when it happened
+
+    * `:severity` - a `Logger` level, such as `:info`, encoded as the
+      severity text and number, according to the syslog mapping in the
+      OpenTelemetry logs data model
+
+    * `:attributes` - the attributes of the log record
+
+    * `:trace_id` - the 16-byte id of the trace of the log record, if any
+
+    * `:span_id` - the 8-byte id of the span of the log record, if any
+
+    * `:flags` - the W3C trace flags, as in `span/6`
+
+    * `:event_name` - the name of the event, if the log record is one
+
+  """
+  @spec log_record(integer(), term(), keyword()) :: binary()
+  def log_record(time, body, opts \\ []) when is_integer(time) do
+    message(2, [
+      <<0x09, time::little-64>>,
+      severity(Keyword.get(opts, :severity)),
+      if(body != nil, do: field(5, any_value(body)), else: []),
+      attributes(6, Keyword.get(opts, :attributes, [])),
+      fixed32(0x45, Keyword.get(opts, :flags)),
+      string(9, Keyword.get(opts, :trace_id, "")),
+      string(10, Keyword.get(opts, :span_id, "")),
+      fixed64(0x59, Keyword.get(opts, :observed_time)),
+      string(12, Keyword.get(opts, :event_name, ""))
+    ])
+  end
+
+  defp severity(nil), do: []
+
+  defp severity(level) do
+    [<<0x10, Map.fetch!(@severities, level)>> | string(3, Atom.to_string(level))]
   end
 
   ## Common

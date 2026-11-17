@@ -90,4 +90,54 @@ defmodule Mint.OTLP.EncoderTest do
              <<0x0A, 2 + byte_size(scope_spans) + 9, resource::binary, scope_spans::binary, 0x12,
                7, scope::binary>>
   end
+
+  test "log_record/3" do
+    assert Encoder.log_record(1, "hi") ==
+             <<0x12, 15, 0x09, 1::little-64, 0x2A, 4, 0x0A, 2, "hi">>
+
+    assert Encoder.log_record(1, nil) == <<0x12, 9, 0x09, 1::little-64>>
+
+    log_record =
+      Encoder.log_record(1, "hi",
+        observed_time: 2,
+        severity: :warning,
+        attributes: [k: 1],
+        trace_id: @trace_id,
+        span_id: @span_id,
+        flags: 1,
+        event_name: "my.event"
+      )
+
+    assert <<0x12, _size, rest::binary>> = log_record
+    assert rest =~ <<0x10, 13, 0x1A, 7, "warning">>
+    assert rest =~ <<0x32, 7, 0x0A, 1, "k", 0x12, 2, 0x18, 1>>
+    assert rest =~ <<0x45, 1::little-32>>
+    assert rest =~ <<0x4A, 16, @trace_id::binary>>
+    assert rest =~ <<0x52, 8, @span_id::binary>>
+    assert rest =~ <<0x59, 2::little-64>>
+    assert rest =~ <<0x62, 8, "my.event">>
+  end
+
+  test "log_record/3 severities" do
+    severities =
+      for level <- [:debug, :info, :notice, :warning, :error, :critical, :alert, :emergency] do
+        <<0x12, _, 0x09, _::64, 0x10, number, _::binary>> =
+          Encoder.log_record(1, nil, severity: level)
+
+        number
+      end
+
+    assert severities == [5, 9, 10, 13, 17, 18, 19, 21]
+  end
+
+  test "logs/2" do
+    resource = Encoder.resource([])
+    scope = Encoder.scope("lib")
+    log_record = Encoder.log_record(1, "hi")
+    {:logs, request} = Encoder.logs(resource, [{scope, [log_record]}])
+
+    assert IO.iodata_to_binary(request) ==
+             <<0x0A, 2 + 2 + 7 + 17, resource::binary, 0x12, 7 + 17, scope::binary,
+               log_record::binary>>
+  end
 end

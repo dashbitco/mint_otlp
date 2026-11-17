@@ -39,9 +39,9 @@ defmodule Mint.OTLP.Requests do
   An `ExportLogsServiceRequest` with a log record.
   """
   def logs do
-    now = System.os_time(:nanosecond)
-    record = [<<0x09, now::little-64>>, <<0x10, 9>>, field(5, string(1, "hello"))]
-    [field(1, [resource(), field(2, [scope(), field(2, record)])])] |> to_iovec()
+    log_record = Encoder.log_record(System.os_time(:nanosecond), "hello", severity: :info)
+    {:logs, request} = Encoder.logs(resource(), [{scope(), [log_record]}])
+    to_iovec(request)
   end
 
   defp resource, do: Encoder.resource(%{"service.name" => "mint_otlp_test"})
