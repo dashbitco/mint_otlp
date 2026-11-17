@@ -1,13 +1,14 @@
 defmodule Mint.OTLP.Encoder do
   @moduledoc """
-  Encodes OTLP export requests for traces and logs as protobuf.
+  Encodes OTLP export requests for traces, logs, and metrics as protobuf.
 
   Telemetry is encoded upfront, as it is produced, and requests are
   built from the encoded parts. Each function returns a binary already
   encoded as a field of the message that contains it, such as a span
-  within its `ScopeSpans` or a log record within its `ScopeLogs`. As protobuf fields may be concatenated, the
-  parts can be stored, counted with `byte_size/1`, and put together
-  into requests without being encoded again.
+  within its `ScopeSpans` or a log record within its `ScopeLogs`. As
+  protobuf fields may be concatenated, the parts can be stored, counted
+  with `byte_size/1`, and put together into requests without being
+  encoded again.
 
       resource = Mint.OTLP.Encoder.resource(%{"service.name" => "my_app"})
       scope = Mint.OTLP.Encoder.scope("my_lib", version: "1.0.0")
@@ -18,6 +19,11 @@ defmodule Mint.OTLP.Encoder do
 
       log_record = Mint.OTLP.Encoder.log_record(time, "hello", severity: :info)
       request = Mint.OTLP.Encoder.logs(resource, [{scope, [log_record]}])
+      {:ok, client, ref} = Mint.OTLP.export(client, request)
+
+      data_point = Mint.OTLP.Encoder.number_data_point(time, 42, attributes: %{"host" => "a"})
+      metric = Mint.OTLP.Encoder.sum("http.requests", [data_point], monotonic: true)
+      request = Mint.OTLP.Encoder.metrics(resource, [{scope, [metric]}])
       {:ok, client, ref} = Mint.OTLP.export(client, request)
 
   The parts are not tagged with their type, so they must be given to the
@@ -109,6 +115,33 @@ defmodule Mint.OTLP.Encoder do
   @spec logs(binary(), [{binary(), [binary()]}]) :: Mint.OTLP.request()
   def logs(resource, scope_logs) when is_binary(resource) and is_list(scope_logs) do
     {:logs, request(resource, scope_logs)}
+  end
+
+  @doc """
+  Encodes an `ExportMetricsServiceRequest` with the given resource, as
+  returned by `resource/1`, and metrics grouped by scope, as returned by
+  `scope/2` and `gauge/3`, `sum/3`, or `histogram/3`:
+
+      message ExportMetricsServiceRequest {
+        repeated ResourceMetrics resource_metrics = 1;
+      }
+
+      message ResourceMetrics {
+        Resource resource = 1;
+        repeated ScopeMetrics scope_metrics = 2;
+      }
+
+      message ScopeMetrics {
+        InstrumentationScope scope = 1;
+        repeated Metric metrics = 2;
+      }
+
+  Returns `{:metrics, iodata}`, to be given to `Mint.OTLP.export/3`.
+  The iodata references the given binaries without copying them.
+  """
+  @spec metrics(binary(), [{binary(), [binary()]}]) :: Mint.OTLP.request()
+  def metrics(resource, scope_metrics) when is_binary(resource) and is_list(scope_metrics) do
+    {:metrics, request(resource, scope_metrics)}
   end
 
   # Requests for all signals have the same shape, with a single resource
@@ -353,6 +386,210 @@ defmodule Mint.OTLP.Encoder do
   defp severity(level) do
     [<<0x10, Map.fetch!(@severities, level)>> | string(3, Atom.to_string(level))]
   end
+
+  ## Metrics
+
+  @doc """
+  Encodes a `Metric` with a `Gauge`, whose data points are values sampled
+  at a given time, as returned by `number_data_point/3`:
+
+      message Metric {
+        string name = 1;
+        string description = 2;
+        string unit = 3;
+        Gauge gauge = 5;
+      }
+
+      message Gauge {
+        repeated NumberDataPoint data_points = 1;
+      }
+
+  ## Options
+
+    * `:description` - the description of the metric
+
+    * `:unit` - the unit of the metric, such as `"ms"` or `"By"`
+
+  """
+  @spec gauge(String.t(), [binary()], keyword()) :: binary()
+  def gauge(name, data_points, opts \\ []) when is_binary(name) and is_list(data_points) do
+    metric(name, opts, field(5, data_points))
+  end
+
+  @doc """
+  Encodes a `Metric` with a `Sum`, whose data points are sums of values
+  over time, as returned by `number_data_point/3`:
+
+      message Metric {
+        string name = 1;
+        string description = 2;
+        string unit = 3;
+        Sum sum = 7;
+      }
+
+      message Sum {
+        repeated NumberDataPoint data_points = 1;
+        AggregationTemporality aggregation_temporality = 2;
+        bool is_monotonic = 3;
+      }
+
+  ## Options
+
+    * `:description` - the description of the metric
+
+    * `:unit` - the unit of the metric, such as `"ms"` or `"By"`
+
+    * `:temporality` - `:cumulative`, if the data points are sums since
+      their start time, or `:delta`, if they are sums since the previous
+      export. Defaults to `:cumulative`
+
+    * `:monotonic` - whether the sum only increases, such as for counters.
+      Defaults to `false`
+
+  """
+  @spec sum(String.t(), [binary()], keyword()) :: binary()
+  def sum(name, data_points, opts \\ []) when is_binary(name) and is_list(data_points) do
+    monotonic = if Keyword.get(opts, :monotonic, false), do: <<0x18, 1>>, else: []
+    metric(name, opts, field(7, [data_points, temporality(opts), monotonic]))
+  end
+
+  @doc """
+  Encodes a `Metric` with a `Histogram`, whose data points are counts of
+  values in buckets, as returned by `histogram_data_point/4`:
+
+      message Metric {
+        string name = 1;
+        string description = 2;
+        string unit = 3;
+        Histogram histogram = 9;
+      }
+
+      message Histogram {
+        repeated HistogramDataPoint data_points = 1;
+        AggregationTemporality aggregation_temporality = 2;
+      }
+
+  ## Options
+
+    * `:description` - the description of the metric
+
+    * `:unit` - the unit of the metric, such as `"ms"` or `"By"`
+
+    * `:temporality` - `:cumulative`, if the data points count values
+      since their start time, or `:delta`, if they count values since the
+      previous export. Defaults to `:cumulative`
+
+  """
+  @spec histogram(String.t(), [binary()], keyword()) :: binary()
+  def histogram(name, data_points, opts \\ []) when is_binary(name) and is_list(data_points) do
+    metric(name, opts, field(9, [data_points, temporality(opts)]))
+  end
+
+  defp metric(name, opts, data) do
+    message(2, [
+      string(1, name),
+      string(2, Keyword.get(opts, :description, "")),
+      string(3, Keyword.get(opts, :unit, "")),
+      data
+    ])
+  end
+
+  defp temporality(opts) do
+    case Keyword.get(opts, :temporality, :cumulative) do
+      :delta -> <<0x10, 1>>
+      :cumulative -> <<0x10, 2>>
+    end
+  end
+
+  @doc """
+  Encodes a `NumberDataPoint`, for gauges and sums:
+
+      message NumberDataPoint {
+        repeated KeyValue attributes = 7;
+        fixed64 start_time_unix_nano = 2;
+        fixed64 time_unix_nano = 3;
+        oneof value {
+          double as_double = 4;
+          sfixed64 as_int = 6;
+        }
+      }
+
+  `value` is encoded as `as_int` if it is an integer and as `as_double`
+  if it is a float.
+
+  ## Options
+
+    * `:start_time` - when the sum started, for cumulative sums
+
+    * `:attributes` - the attributes of the data point
+
+  """
+  @spec number_data_point(integer(), number(), keyword()) :: binary()
+  def number_data_point(time, value, opts \\ []) when is_integer(time) and is_number(value) do
+    value =
+      if is_integer(value),
+        do: <<0x31, value::little-signed-64>>,
+        else: <<0x21, value::little-float-64>>
+
+    message(1, [
+      fixed64(0x11, Keyword.get(opts, :start_time)),
+      <<0x19, time::little-64>>,
+      value,
+      attributes(7, Keyword.get(opts, :attributes, []))
+    ])
+  end
+
+  @doc """
+  Encodes a `HistogramDataPoint`:
+
+      message HistogramDataPoint {
+        repeated KeyValue attributes = 9;
+        fixed64 start_time_unix_nano = 2;
+        fixed64 time_unix_nano = 3;
+        fixed64 count = 4;
+        optional double sum = 5;
+        repeated fixed64 bucket_counts = 6;
+        repeated double explicit_bounds = 7;
+        optional double min = 11;
+        optional double max = 12;
+      }
+
+  `bucket_counts` has the number of values in each bucket, and
+  `explicit_bounds` the upper bounds of each bucket but the last,
+  which is unbounded. So `bucket_counts` has one element more than
+  `explicit_bounds`. The count of the data point is the sum of
+  `bucket_counts`.
+
+  ## Options
+
+    * `:start_time` - when counting started, for cumulative histograms
+
+    * `:sum` - the sum of the values
+
+    * `:min` - the minimum value
+
+    * `:max` - the maximum value
+
+    * `:attributes` - the attributes of the data point
+
+  """
+  @spec histogram_data_point(integer(), [non_neg_integer()], [number()], keyword()) :: binary()
+  def histogram_data_point(time, bucket_counts, explicit_bounds, opts \\ [])
+      when is_integer(time) and is_list(bucket_counts) and is_list(explicit_bounds) do
+    message(1, [
+      fixed64(0x11, Keyword.get(opts, :start_time)),
+      <<0x19, time::little-64, 0x21, Enum.sum(bucket_counts)::little-64>>,
+      double(0x29, Keyword.get(opts, :sum)),
+      field(6, for(count <- bucket_counts, into: <<>>, do: <<count::little-64>>)),
+      field(7, for(bound <- explicit_bounds, into: <<>>, do: <<bound::little-float-64>>)),
+      attributes(9, Keyword.get(opts, :attributes, [])),
+      double(0x59, Keyword.get(opts, :min)),
+      double(0x61, Keyword.get(opts, :max))
+    ])
+  end
+
+  defp double(_tag, nil), do: []
+  defp double(tag, value), do: <<tag, value::little-float-64>>
 
   ## Common
 

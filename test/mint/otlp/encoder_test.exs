@@ -140,4 +140,70 @@ defmodule Mint.OTLP.EncoderTest do
              <<0x0A, 2 + 2 + 7 + 17, resource::binary, 0x12, 7 + 17, scope::binary,
                log_record::binary>>
   end
+
+  test "number_data_point/3" do
+    assert Encoder.number_data_point(1, 42) ==
+             <<0x0A, 18, 0x19, 1::little-64, 0x31, 42::little-signed-64>>
+
+    assert Encoder.number_data_point(1, -1) =~ <<0x31, -1::little-signed-64>>
+    assert Encoder.number_data_point(1, 1.5) =~ <<0x21, 1.5::little-float-64>>
+
+    data_point = Encoder.number_data_point(2, 1, start_time: 1, attributes: [k: 1])
+    assert data_point =~ <<0x11, 1::little-64, 0x19, 2::little-64>>
+    assert data_point =~ <<0x3A, 7, 0x0A, 1, "k", 0x12, 2, 0x18, 1>>
+  end
+
+  test "histogram_data_point/4" do
+    assert Encoder.histogram_data_point(1, [1, 2], [10]) ==
+             <<0x0A, 46, 0x19, 1::little-64, 0x21, 3::little-64, 0x32, 16, 1::little-64,
+               2::little-64, 0x3A, 8, 10.0::little-float-64>>
+
+    data_point =
+      Encoder.histogram_data_point(2, [1], [],
+        start_time: 1,
+        sum: 3,
+        min: 1,
+        max: 2,
+        attributes: [k: 1]
+      )
+
+    assert data_point =~ <<0x11, 1::little-64, 0x19, 2::little-64>>
+    assert data_point =~ <<0x29, 3.0::little-float-64>>
+    assert data_point =~ <<0x4A, 7, 0x0A, 1, "k", 0x12, 2, 0x18, 1>>
+    assert data_point =~ <<0x59, 1.0::little-float-64, 0x61, 2.0::little-float-64>>
+  end
+
+  test "gauge/3, sum/3, and histogram/3" do
+    data_point = Encoder.number_data_point(1, 42)
+    size = byte_size(data_point)
+
+    assert Encoder.gauge("g", [data_point], description: "d", unit: "u") ==
+             <<0x12, 9 + 2 + size, 0x0A, 1, "g", 0x12, 1, "d", 0x1A, 1, "u", 0x2A, size,
+               data_point::binary>>
+
+    assert Encoder.sum("s", [data_point]) ==
+             <<0x12, 3 + 2 + size + 2, 0x0A, 1, "s", 0x3A, size + 2, data_point::binary, 0x10, 2>>
+
+    assert Encoder.sum("s", [data_point], temporality: :delta, monotonic: true) ==
+             <<0x12, 3 + 2 + size + 4, 0x0A, 1, "s", 0x3A, size + 4, data_point::binary, 0x10, 1,
+               0x18, 1>>
+
+    data_point = Encoder.histogram_data_point(1, [1], [])
+    size = byte_size(data_point)
+
+    assert Encoder.histogram("h", [data_point]) ==
+             <<0x12, 3 + 2 + size + 2, 0x0A, 1, "h", 0x4A, size + 2, data_point::binary, 0x10, 2>>
+  end
+
+  test "metrics/2" do
+    resource = Encoder.resource([])
+    scope = Encoder.scope("lib")
+    metric = Encoder.gauge("g", [Encoder.number_data_point(1, 42)])
+    {:metrics, request} = Encoder.metrics(resource, [{scope, [metric]}])
+
+    size = 7 + byte_size(metric)
+
+    assert IO.iodata_to_binary(request) ==
+             <<0x0A, 2 + 2 + size, resource::binary, 0x12, size, scope::binary, metric::binary>>
+  end
 end

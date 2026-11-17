@@ -84,8 +84,8 @@ defmodule Mint.OTLP do
   @type signal() :: :traces | :metrics | :logs
 
   @typedoc """
-  An encoded request for a signal, such as returned by `Mint.OTLP.Encoder.traces/2`
-  and `Mint.OTLP.Encoder.logs/2`.
+  An encoded request for a signal, such as returned by `Mint.OTLP.Encoder.traces/2`,
+  `Mint.OTLP.Encoder.logs/2`, and `Mint.OTLP.Encoder.metrics/2`.
 
   The request is an `ExportTraceServiceRequest`, `ExportMetricsServiceRequest`,
   or `ExportLogsServiceRequest` encoded as protobuf, according to the signal.

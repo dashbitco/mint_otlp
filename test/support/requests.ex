@@ -2,8 +2,6 @@ defmodule Mint.OTLP.Requests do
   @moduledoc """
   Encodes minimal OTLP export requests for tests.
   """
-  import Bitwise
-
   alias Mint.OTLP.Encoder
 
   @doc """
@@ -29,10 +27,10 @@ defmodule Mint.OTLP.Requests do
   An `ExportMetricsServiceRequest` with a gauge.
   """
   def metrics do
-    now = System.os_time(:nanosecond)
-    data_point = [<<0x19, now::little-64>>, <<0x31, 42::little-64>>]
-    metric = [string(1, "mint_otlp.test"), field(5, field(1, data_point))]
-    [field(1, [resource(), field(2, [scope(), field(2, metric)])])] |> to_iovec()
+    data_point = Encoder.number_data_point(System.os_time(:nanosecond), 42.0)
+    metric = Encoder.gauge("mint_otlp.test", [data_point])
+    {:metrics, request} = Encoder.metrics(resource(), [{scope(), [metric]}])
+    to_iovec(request)
   end
 
   @doc """
@@ -48,12 +46,4 @@ defmodule Mint.OTLP.Requests do
   defp scope, do: Encoder.scope("mint_otlp", version: "0.1.0")
 
   defp to_iovec(iodata), do: :erlang.iolist_to_iovec(iodata)
-
-  defp field(number, iodata),
-    do: [varint(number <<< 3 ||| 2), varint(IO.iodata_length(iodata)), iodata]
-
-  defp string(number, binary), do: field(number, binary)
-
-  defp varint(n) when n < 128, do: <<n>>
-  defp varint(n), do: <<1::1, n &&& 127::7, varint(n >>> 7)::binary>>
 end
