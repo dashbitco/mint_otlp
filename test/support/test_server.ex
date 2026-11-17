@@ -13,6 +13,8 @@ defmodule Mint.OTLP.TestServer do
     * `http:STATUS` - an HTTP status without gRPC status
     * `sleep:MILLISECONDS:RESPONSE` - waits before reading the body,
       so flow control windows are not refilled meanwhile
+    * `block:RESPONSE` - sends `{:test_server, :blocked, pid}` to the test
+      process and waits until `pid` receives `:continue`
 
   When `headers/2` is given a number of times, the response is only
   used that many times for the export, and `ok` afterwards.
@@ -53,6 +55,19 @@ defmodule Mint.OTLP.TestServer do
     [{"x-test-pid", pid}, {"x-test", response}, {"x-test-id", id}, {"x-test-times", "#{times}"}]
   end
 
+  @doc """
+  How many times the server received the export with the given headers,
+  if it was given a number of times.
+  """
+  def count(headers) do
+    {_, id} = List.keyfind(headers, "x-test-id", 0)
+
+    case :ets.lookup(__MODULE__, id) do
+      [{^id, count}] -> count
+      [] -> 0
+    end
+  end
+
   @impl true
   def init(opts), do: opts
 
@@ -70,18 +85,28 @@ defmodule Mint.OTLP.TestServer do
           Process.sleep(String.to_integer(ms))
           response
 
+        ["block", response] ->
+          send(test_pid(conn), {:test_server, :blocked, self()})
+          receive do: (:continue -> response)
+
         _ ->
           response
       end
 
     {body, conn} = read_body(conn, [])
 
-    with [pid] <- Plug.Conn.get_req_header(conn, "x-test-pid") do
-      pid = pid |> Base.decode64!() |> :erlang.binary_to_term()
+    if pid = test_pid(conn) do
       send(pid, {:test_server, conn.request_path, conn.req_headers, body})
     end
 
     respond(conn, String.split(response, ":", parts: 3))
+  end
+
+  defp test_pid(conn) do
+    case Plug.Conn.get_req_header(conn, "x-test-pid") do
+      [pid] -> pid |> Base.decode64!() |> :erlang.binary_to_term()
+      [] -> nil
+    end
   end
 
   defp limit(conn, response) do
